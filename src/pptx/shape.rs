@@ -43,6 +43,11 @@ pub struct PictureShape {
     pub position: Option<ShapePosition>,
     /// Relationship ID (`r:embed`) of the underlying media part, if any.
     pub embed_rid: Option<String>,
+    /// Package-relative path to the image part (e.g. `/ppt/media/image3.png`),
+    /// resolved from `embed_rid` via the slide relationships. `None` when the
+    /// relationship could not be resolved. Consumed by the markdown renderer
+    /// when a `baseurl` is supplied so pictures emit servable URLs.
+    pub media_path: Option<String>,
     /// Raw image bytes resolved via `embed_rid`, if the slide carried a
     /// resolvable IMAGE relationship at parse time.
     pub data: Option<Vec<u8>>,

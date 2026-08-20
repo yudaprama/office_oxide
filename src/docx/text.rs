@@ -29,20 +29,34 @@ impl DocxDocument {
     /// renderer (PDF, HTML, search index) sees the full visible content
     /// of every page. Without this, simple-but-meaningful artefacts like
     /// `My header` / `My footer` are silently dropped.
+    ///
+    /// Embedded images are referenced by their relationship id (e.g.
+    /// `rId7`); pass a `baseurl` to [`Self::to_markdown_with_baseurl`] to
+    /// rewrite them to servable URLs instead.
     pub fn to_markdown(&self) -> String {
+        self.to_markdown_with_baseurl(None)
+    }
+
+    /// Convert the document to Markdown, rewriting embedded image references to
+    /// servable URLs rooted at `baseurl` when supplied. `baseurl` is joined with
+    /// the package-relative image path resolved from each drawing's relationship
+    /// id, producing e.g. `/office-files/word/media/image1.png`. When `baseurl`
+    /// is `None` (or a drawing's path could not be resolved) images fall back to
+    /// the bare relationship id, matching [`Self::to_markdown`].
+    pub fn to_markdown_with_baseurl(&self, baseurl: Option<&str>) -> String {
         let mut out = String::new();
         let ctx = MarkdownCtx {
             styles: self.styles.as_ref(),
             numbering: self.numbering.as_ref(),
         };
 
-        let (header_texts, footer_texts) = split_headers_footers(self, &ctx);
+        let (header_texts, footer_texts) = split_headers_footers(self, &ctx, baseurl);
         for h in &header_texts {
             out.push_str(h);
             out.push_str("\n\n");
         }
 
-        markdown_blocks(&self.body.elements, &ctx, &mut out, 0);
+        markdown_blocks(&self.body.elements, &ctx, &mut out, 0, baseurl);
 
         for f in &footer_texts {
             if !out.ends_with("\n\n") {
@@ -64,7 +78,11 @@ impl DocxDocument {
 /// directly from each entry's `is_header` field (set at parse time),
 /// so this is correct regardless of how many sections the document
 /// has or how the entries are interleaved.
-fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>, Vec<String>) {
+fn split_headers_footers(
+    doc: &DocxDocument,
+    ctx: &MarkdownCtx,
+    baseurl: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     let mut headers: Vec<String> = Vec::new();
     let mut footers: Vec<String> = Vec::new();
     let mut header_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -72,7 +90,7 @@ fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>,
 
     for hf in &doc.headers_footers {
         let mut buf = String::new();
-        markdown_blocks(&hf.content, ctx, &mut buf, 0);
+        markdown_blocks(&hf.content, ctx, &mut buf, 0, baseurl);
         let t = buf.trim().to_string();
         if t.is_empty() {
             continue;
@@ -147,7 +165,13 @@ struct MarkdownCtx<'a> {
     numbering: Option<&'a NumberingDefinitions>,
 }
 
-fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut String, _depth: usize) {
+fn markdown_blocks(
+    elements: &[BlockElement],
+    ctx: &MarkdownCtx,
+    out: &mut String,
+    _depth: usize,
+    baseurl: Option<&str>,
+) {
     for elem in elements {
         match elem {
             BlockElement::Paragraph(p) => {
@@ -196,7 +220,7 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
                 // Render paragraph content with inline formatting
                 for content in &p.content {
                     match content {
-                        ParagraphContent::Run(run) => markdown_run(run, out),
+                        ParagraphContent::Run(run) => markdown_run(run, out, baseurl),
                         ParagraphContent::Hyperlink(hl) => {
                             let text = runs_to_plain_text(&hl.runs);
                             match &hl.target {
@@ -232,7 +256,7 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
     }
 }
 
-fn markdown_run(run: &Run, out: &mut String) {
+fn markdown_run(run: &Run, out: &mut String, baseurl: Option<&str>) {
     let bold = run
         .properties
         .as_ref()
@@ -260,7 +284,7 @@ fn markdown_run(run: &Run, out: &mut String) {
             },
             RunContent::Tab => text.push('\t'),
             RunContent::Drawing(drawing) => {
-                markdown_drawing(drawing, &mut text);
+                markdown_drawing(drawing, &mut text, baseurl);
             },
         }
     }
@@ -295,13 +319,20 @@ fn markdown_run(run: &Run, out: &mut String) {
     }
 }
 
-fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
+fn markdown_drawing(drawing: &DrawingInfo, out: &mut String, baseurl: Option<&str>) {
     out.push_str("![");
     if let Some(ref desc) = drawing.description {
         out.push_str(desc);
     }
     out.push_str("](");
-    out.push_str(&drawing.relationship_id);
+    match (baseurl, &drawing.media_path) {
+        (Some(b), Some(mp)) => {
+            out.push_str(b.trim_end_matches('/'));
+            out.push('/');
+            out.push_str(mp.trim_start_matches('/'));
+        }
+        _ => out.push_str(&drawing.relationship_id),
+    }
     out.push(')');
 }
 
@@ -370,4 +401,62 @@ fn runs_to_plain_text(runs: &[Run]) -> String {
         plain_text_run(run, &mut text);
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::docx::Emu;
+
+    fn drawing(rel_id: &str, media_path: Option<&str>, desc: Option<&str>) -> DrawingInfo {
+        DrawingInfo {
+            relationship_id: rel_id.to_string(),
+            media_path: media_path.map(|s| s.to_string()),
+            description: desc.map(|s| s.to_string()),
+            width: Emu(0),
+            height: Emu(0),
+            inline: true,
+            anchor_position: None,
+            shape: None,
+        }
+    }
+
+    #[test]
+    fn drawing_uses_baseurl_and_media_path() {
+        let d = drawing("rId7", Some("word/media/image1.png"), Some("logo"));
+        let mut out = String::new();
+        markdown_drawing(&d, &mut out, Some("/office-files"));
+        assert_eq!(out, "![logo](/office-files/word/media/image1.png)");
+    }
+
+    #[test]
+    fn drawing_strips_trailing_slash_from_baseurl() {
+        let d = drawing("rId7", Some("word/media/image1.png"), None);
+        let mut out = String::new();
+        markdown_drawing(&d, &mut out, Some("/office-files/"));
+        assert_eq!(out, "![](/office-files/word/media/image1.png)");
+    }
+
+    #[test]
+    fn drawing_keeps_relative_media_path() {
+        let d = drawing("rId3", Some("word/media/image2.png"), Some("chart"));
+        let mut out = String::new();
+        markdown_drawing(&d, &mut out, Some("https://example.com/files"));
+        assert_eq!(out, "![chart](https://example.com/files/word/media/image2.png)");
+    }
+
+    #[test]
+    fn drawing_falls_back_to_relationship_id() {
+        // No baseurl supplied.
+        let d = drawing("rId7", Some("word/media/image1.png"), None);
+        let mut out = String::new();
+        markdown_drawing(&d, &mut out, None);
+        assert_eq!(out, "![](rId7)");
+
+        // Baseurl supplied but media path unresolved.
+        let d2 = drawing("rId9", None, Some("pic"));
+        let mut out2 = String::new();
+        markdown_drawing(&d2, &mut out2, Some("/office-files"));
+        assert_eq!(out2, "![pic](rId9)");
+    }
 }

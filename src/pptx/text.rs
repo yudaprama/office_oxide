@@ -47,10 +47,24 @@ impl PptxDocument {
     }
 
     /// Convert the entire presentation to markdown.
+    /// Convert the presentation to Markdown. Embedded pictures are emitted
+    /// with an empty image URL (`![alt]()`); pass a `baseurl` to
+    /// [`Self::to_markdown_with_baseurl`] to rewrite them to servable URLs.
     pub fn to_markdown(&self) -> String {
+        self.to_markdown_with_baseurl(None)
+    }
+
+    /// Convert the presentation to Markdown, rewriting embedded picture
+    /// references to servable URLs rooted at `baseurl` when supplied.
+    /// `baseurl` is joined with each picture's package-relative image path
+    /// (e.g. `/ppt/media/image3.png`), producing e.g.
+    /// `/office-files/ppt/media/image3.png`. When `baseurl` is `None` (or a
+    /// picture's path could not be resolved) pictures fall back to `![alt]()`,
+    /// matching [`Self::to_markdown`].
+    pub fn to_markdown_with_baseurl(&self, baseurl: Option<&str>) -> String {
         let mut parts = Vec::new();
         for (i, _) in self.slides.iter().enumerate() {
-            if let Some(md) = self.slide_to_markdown(i) {
+            if let Some(md) = self.slide_to_markdown(i, baseurl) {
                 parts.push(md);
             }
         }
@@ -58,7 +72,7 @@ impl PptxDocument {
     }
 
     /// Convert a single slide to markdown by index.
-    pub fn slide_to_markdown(&self, index: usize) -> Option<String> {
+    pub fn slide_to_markdown(&self, index: usize, baseurl: Option<&str>) -> Option<String> {
         let slide = self.slides.get(index)?;
         let mut result = String::new();
 
@@ -71,7 +85,7 @@ impl PptxDocument {
         }
 
         let mut entries = Vec::new();
-        collect_markdown_entries(&slide.shapes, &mut entries);
+        collect_markdown_entries(&slide.shapes, &mut entries, baseurl);
         entries.sort_by(|a, b| spatial_cmp(&a.0, &b.0));
 
         for (_, md) in &entries {
@@ -190,7 +204,11 @@ fn plain_text_from_table(table: &Table) -> String {
 // Markdown collection
 // ---------------------------------------------------------------------------
 
-fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePosition>, String)>) {
+fn collect_markdown_entries(
+    shapes: &[Shape],
+    entries: &mut Vec<(Option<ShapePosition>, String)>,
+    baseurl: Option<&str>,
+) {
     for shape in shapes {
         match shape {
             Shape::AutoShape(auto) => {
@@ -212,12 +230,18 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
             Shape::Picture(pic) => {
                 if let Some(ref alt) = pic.alt_text {
                     if !alt.is_empty() {
-                        entries.push((pic.position.clone(), format!("![{alt}]()")));
+                        let url = match (baseurl, &pic.media_path) {
+                            (Some(b), Some(mp)) => {
+                                format!("{}/{}", b.trim_end_matches('/'), mp.trim_start_matches('/'))
+                            }
+                            _ => String::new(),
+                        };
+                        entries.push((pic.position.clone(), format!("![{alt}]({url})")));
                     }
                 }
             },
             Shape::Group(grp) => {
-                collect_markdown_entries(&grp.children, entries);
+                collect_markdown_entries(&grp.children, entries, baseurl);
             },
             Shape::GraphicFrame(gf) => {
                 if let GraphicContent::Table(ref tbl) = gf.content {
@@ -563,7 +587,7 @@ mod tests {
             background_rgb: None,
         }]);
 
-        let md = doc.slide_to_markdown(0).unwrap();
+        let md = doc.slide_to_markdown(0, None).unwrap();
         assert!(md.starts_with("## My Title\n\n"));
         assert!(md.contains("Body text"));
         // Title should not be duplicated in body
@@ -626,7 +650,7 @@ mod tests {
             background_rgb: None,
         }]);
 
-        let md = doc.slide_to_markdown(0).unwrap();
+        let md = doc.slide_to_markdown(0, None).unwrap();
         assert!(md.contains("**bold** and *italic*"));
     }
 
@@ -639,7 +663,7 @@ mod tests {
             background_rgb: None,
         }]);
 
-        let md = doc.slide_to_markdown(0).unwrap();
+        let md = doc.slide_to_markdown(0, None).unwrap();
         assert!(md.contains("> Note line 1\n> Note line 2"));
     }
 
@@ -761,7 +785,7 @@ mod tests {
             background_rgb: None,
         }]);
 
-        let md = doc.slide_to_markdown(0).unwrap();
+        let md = doc.slide_to_markdown(0, None).unwrap();
         assert!(md.contains("| H1 | H2 |"));
         assert!(md.contains("| --- | --- |"));
         assert!(md.contains("| A | B |"));
@@ -808,7 +832,54 @@ mod tests {
             background_rgb: None,
         }]);
 
-        let md = doc.slide_to_markdown(0).unwrap();
+        let md = doc.slide_to_markdown(0, None).unwrap();
         assert!(md.contains("[Click here](https://example.com)"));
+    }
+
+    #[test]
+    fn picture_uses_baseurl_and_media_path() {
+        use super::collect_markdown_entries;
+
+        let pic = Shape::Picture(PictureShape {
+            id: 1,
+            name: "img".to_string(),
+            alt_text: Some("logo".to_string()),
+            position: Some(ShapePosition {
+                x: 0,
+                y: 0,
+                cx: 1000,
+                cy: 500,
+            }),
+            embed_rid: Some("rId2".to_string()),
+            media_path: Some("/ppt/media/image1.png".to_string()),
+            data: None,
+            format: None,
+        });
+        let shapes = vec![pic];
+        let mut entries = Vec::new();
+        collect_markdown_entries(&shapes, &mut entries, Some("/office-files"));
+        let md: String = entries.into_iter().map(|(_, s)| s).collect();
+        assert_eq!(md, "![logo](/office-files/ppt/media/image1.png)");
+    }
+
+    #[test]
+    fn picture_falls_back_to_empty_url_without_baseurl() {
+        use super::collect_markdown_entries;
+
+        let pic = Shape::Picture(PictureShape {
+            id: 1,
+            name: "img".to_string(),
+            alt_text: Some("logo".to_string()),
+            position: None,
+            embed_rid: Some("rId2".to_string()),
+            media_path: Some("/ppt/media/image1.png".to_string()),
+            data: None,
+            format: None,
+        });
+        let shapes = vec![pic];
+        let mut entries = Vec::new();
+        collect_markdown_entries(&shapes, &mut entries, None);
+        let md: String = entries.into_iter().map(|(_, s)| s).collect();
+        assert_eq!(md, "![logo]()");
     }
 }

@@ -173,7 +173,7 @@ impl DocxDocument {
 
         // Parse main document
         let doc_data = opc.read_part(&main_part)?;
-        let (body, sections) = parse_document(&doc_data, &doc_rels)?;
+        let (mut body, sections) = parse_document(&doc_data, &doc_rels)?;
 
         // Parse headers and footers. Walk header refs and footer refs
         // separately so each parsed `HeaderFooter` can record its own
@@ -247,6 +247,10 @@ impl DocxDocument {
         // without re-sniffing magic bytes.
         let mut images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
             std::collections::HashMap::new();
+        // rId → package-relative image path (e.g. `word/media/image1.png`),
+        // captured so the markdown renderer can emit servable URLs.
+        let mut media_paths: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for rel in doc_rels.get_by_type(rel_types::IMAGE) {
             if rel.target_mode != TargetMode::Internal {
                 continue;
@@ -255,6 +259,7 @@ impl DocxDocument {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            media_paths.insert(rel.id.clone(), part_name.as_str().to_string());
             if !opc.has_part(&part_name) {
                 continue;
             }
@@ -277,6 +282,14 @@ impl DocxDocument {
             embedded_fonts.len(),
             images.len()
         );
+
+        // Resolve each drawing's relationship id to its package-relative image
+        // path so the markdown renderer can produce servable URLs.
+        resolve_drawing_media(&mut body.elements, &media_paths);
+        for hf in &mut headers_footers {
+            resolve_drawing_media(&mut hf.content, &media_paths);
+        }
+
         Ok(DocxDocument {
             body,
             styles,
@@ -681,6 +694,7 @@ fn parse_inline_or_anchor_body(
     if relationship_id.is_some() || shape.is_some() {
         Ok(Some(DrawingInfo {
             relationship_id: relationship_id.unwrap_or_default(),
+            media_path: None,
             description,
             width,
             height,
@@ -690,6 +704,52 @@ fn parse_inline_or_anchor_body(
         }))
     } else {
         Ok(None)
+    }
+}
+
+/// Walk block elements and resolve every drawing's `relationship_id` to its
+/// package-relative image path (recorded in `paths`). Vector shapes and
+/// drawings whose relationship id is unknown are left with `media_path = None`.
+fn resolve_drawing_media(
+    elements: &mut [BlockElement],
+    paths: &std::collections::HashMap<String, String>,
+) {
+    for elem in elements {
+        match elem {
+            BlockElement::Paragraph(p) => {
+                for pc in &mut p.content {
+                    match pc {
+                        ParagraphContent::Run(run) => {
+                            for rc in &mut run.content {
+                                if let RunContent::Drawing(d) = rc {
+                                    if let Some(mp) = paths.get(&d.relationship_id) {
+                                        d.media_path = Some(mp.clone());
+                                    }
+                                }
+                            }
+                        }
+                        ParagraphContent::Hyperlink(hl) => {
+                            for run in &mut hl.runs {
+                                for rc in &mut run.content {
+                                    if let RunContent::Drawing(d) = rc {
+                                        if let Some(mp) = paths.get(&d.relationship_id) {
+                                            d.media_path = Some(mp.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            BlockElement::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        resolve_drawing_media(&mut cell.content, paths);
+                    }
+                }
+            }
+        }
     }
 }
 

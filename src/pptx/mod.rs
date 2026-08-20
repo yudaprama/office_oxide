@@ -109,6 +109,9 @@ impl PptxDocument {
             /// Pre-resolved here in Phase 1 so the parallel slide parser
             /// (Phase 2) doesn't need access to the OPC reader.
             media: std::collections::HashMap<String, (Vec<u8>, String)>,
+            /// rId → package-relative image path (e.g. `/ppt/media/image3.png`),
+            /// captured so the markdown renderer can emit servable URLs.
+            media_paths: std::collections::HashMap<String, String>,
         }
         let mut bundles = Vec::with_capacity(presentation.slides.len());
         for (slide_idx, slide_id) in presentation.slides.iter().enumerate() {
@@ -150,6 +153,7 @@ impl PptxDocument {
             // Parsing happens in parallel below and can't use the OPC
             // reader, so we materialise the bytes here keyed by rId.
             let mut media = std::collections::HashMap::new();
+            let mut media_paths = std::collections::HashMap::new();
             for rel in slide_rels.all() {
                 if rel.rel_type != rel_types::IMAGE {
                     continue;
@@ -158,6 +162,7 @@ impl PptxDocument {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
+                media_paths.insert(rel.id.clone(), target.as_str().to_string());
                 if !opc.has_part(&target) {
                     continue;
                 }
@@ -178,6 +183,7 @@ impl PptxDocument {
                 slide_rels,
                 notes_data,
                 media,
+                media_paths,
             });
         }
 
@@ -188,6 +194,9 @@ impl PptxDocument {
             if let Some(notes_data) = &b.notes_data {
                 parsed.notes = extract_notes_text(notes_data);
             }
+            // Resolve each picture's relationship id to its package-relative
+            // image path so the markdown renderer can produce servable URLs.
+            resolve_picture_media(&mut parsed.shapes, &b.media_paths);
             Ok(parsed)
         })?;
 
@@ -292,5 +301,27 @@ impl crate::core::OfficeDocument for PptxDocument {
 
     fn to_markdown(&self) -> String {
         self.to_markdown()
+    }
+}
+
+/// Walk slide shapes (recursing into groups) and resolve every picture's
+/// `embed_rid` to its package-relative image path (recorded in `paths`).
+/// Pictures whose relationship id is unknown are left with `media_path = None`.
+fn resolve_picture_media(
+    shapes: &mut [Shape],
+    paths: &std::collections::HashMap<String, String>,
+) {
+    for shape in shapes {
+        match shape {
+            Shape::Picture(pic) => {
+                if let Some(rid) = &pic.embed_rid {
+                    if let Some(mp) = paths.get(rid) {
+                        pic.media_path = Some(mp.clone());
+                    }
+                }
+            }
+            Shape::Group(grp) => resolve_picture_media(&mut grp.children, paths),
+            _ => {}
+        }
     }
 }

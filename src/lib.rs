@@ -338,6 +338,22 @@ impl Document {
         dispatch_inner!(self, to_markdown)
     }
 
+    /// Convert to markdown, rewriting embedded image references to servable
+    /// URLs rooted at `baseurl` (e.g. `"/office-files"` yields
+    /// `/office-files/word/media/image1.png`) when supplied. Only the DOCX
+    /// renderer emits inline images in markdown, so other formats ignore
+    /// `baseurl` and fall back to [`Self::to_markdown`].
+    pub fn to_markdown_with_baseurl(&self, baseurl: Option<&str>) -> String {
+        match &self.inner {
+            DocumentInner::Docx(doc) => doc.to_markdown_with_baseurl(baseurl),
+            DocumentInner::Xlsx(doc) => doc.to_markdown(),
+            DocumentInner::Pptx(doc) => doc.to_markdown_with_baseurl(baseurl),
+            DocumentInner::Doc(doc) => doc.to_markdown(),
+            DocumentInner::Xls(doc) => doc.to_markdown(),
+            DocumentInner::Ppt(doc) => doc.to_markdown(),
+        }
+    }
+
     /// Convert to an HTML fragment.
     pub fn to_html(&self) -> String {
         self.to_ir().to_html()

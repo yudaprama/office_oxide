@@ -12,6 +12,12 @@ pub struct DrawingInfo {
     /// Relationship ID pointing to the image part. Empty when the
     /// drawing is a vector shape rather than a raster picture.
     pub relationship_id: String,
+    /// Package-relative path to the image part (e.g. `word/media/image1.png`),
+    /// resolved from `relationship_id` via the part relationships. `None` for
+    /// vector shapes and when resolution failed. Consumed by the markdown
+    /// renderer when a `baseurl` is supplied so embedded images emit servable
+    /// URLs instead of bare relationship ids.
+    pub media_path: Option<String>,
     /// Alt-text description from `wp:docPr/@descr`.
     pub description: Option<String>,
     /// Image / shape width in EMUs.

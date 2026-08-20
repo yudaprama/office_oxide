@@ -288,6 +288,7 @@ fn parse_picture(
         alt_text,
         position,
         embed_rid,
+        media_path: None,
         data,
         format,
     }))
