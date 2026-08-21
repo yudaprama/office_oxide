@@ -82,6 +82,16 @@ impl ContentTypes {
     pub fn overrides(&self) -> &HashMap<PartName, String> {
         &self.overrides
     }
+
+    /// Insert or replace an override content-type entry for a part name.
+    pub fn add_override(&mut self, part_name: PartName, content_type: &str) {
+        self.overrides.insert(part_name, content_type.to_string());
+    }
+
+    /// Remove an override content-type entry for a part name.
+    pub fn remove_override(&mut self, part_name: &PartName) {
+        self.overrides.remove(part_name);
+    }
 }
 
 /// Builder for constructing a `[Content_Types].xml` for the write path.

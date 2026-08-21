@@ -76,6 +76,71 @@ impl EditablePackage {
         self.parts.insert(name, data);
     }
 
+    /// Remove a part, returning its bytes if present.
+    pub fn remove_part(&mut self, name: &PartName) -> Option<Vec<u8>> {
+        self.content_types.remove_override(name);
+        self.part_rels.remove(name);
+        self.parts.remove(name)
+    }
+
+    /// Add a part and register its content type as an override.
+    pub fn add_part_with_content_type(
+        &mut self,
+        name: PartName,
+        data: Vec<u8>,
+        content_type: &str,
+    ) {
+        self.parts.insert(name.clone(), data);
+        self.content_types.add_override(name, content_type);
+    }
+
+    /// Add a relationship for `source` (a part name; use `/` for the package
+    /// root). Returns the newly assigned rId.
+    pub fn add_relationship(
+        &mut self,
+        source: &PartName,
+        rel_type: &str,
+        target: &str,
+    ) -> String {
+        let next = self.next_rid_all();
+        let id = format!("rId{next}");
+        let rel = super::relationships::Relationship {
+            id: id.clone(),
+            rel_type: rel_type.to_string(),
+            target: target.to_string(),
+            target_mode: super::relationships::TargetMode::Internal,
+        };
+        self.part_rels
+            .entry(source.clone())
+            .or_insert_with(super::relationships::Relationships::empty)
+            .add(rel);
+        id
+    }
+
+    /// Remove the relationship with `id` from `source`'s relationships.
+    pub fn remove_relationship(&mut self, source: &PartName, id: &str) {
+        if let Some(rels) = self.part_rels.get_mut(source) {
+            rels.remove_by_id(id);
+        }
+        if self.part_rels.get(source).map(|r| r.all().is_empty()) == Some(true) {
+            self.part_rels.remove(source);
+        }
+    }
+
+    /// Next rId number across package-level and all part-level rels.
+    fn next_rid_all(&self) -> u32 {
+        let mut max = 0u32;
+        for r in self.package_rels.all() {
+            max = max.max(parse_rid(&r.id));
+        }
+        for rels in self.part_rels.values() {
+            for r in rels.all() {
+                max = max.max(parse_rid(&r.id));
+            }
+        }
+        max + 1
+    }
+
     /// Get the content types table.
     pub fn content_types(&self) -> &ContentTypes {
         &self.content_types
@@ -153,4 +218,11 @@ impl EditablePackage {
         zip.finish()?;
         Ok(())
     }
+}
+
+/// Parse the numeric suffix of an rId (e.g. "rId12" -> 12). Returns 0 if none.
+fn parse_rid(id: &str) -> u32 {
+    id.strip_prefix("rId")
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0)
 }

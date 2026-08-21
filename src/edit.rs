@@ -9,6 +9,95 @@ use std::path::Path;
 use crate::Result;
 use crate::format::DocumentFormat;
 
+// ── edit operation specifications ────────────────────────────────────────────
+//
+// These describe declarative edits the caller wants applied. They are produced
+// from a higher-level tool contract (e.g. kawai's office_edit_document) and
+// kept here so the edit logic is self-contained.
+
+/// A text run inside a DOCX paragraph/heading/list block.
+#[derive(Debug, Clone)]
+pub struct DocxRun {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    /// Font size in points.
+    pub size: Option<f64>,
+    /// Hex color, e.g. "FF0000".
+    pub color: Option<String>,
+    /// Font family name.
+    pub font: Option<String>,
+}
+
+impl DocxRun {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            bold: false,
+            italic: false,
+            size: None,
+            color: None,
+            font: None,
+        }
+    }
+}
+
+/// The kind of DOCX block to append.
+#[derive(Debug, Clone, Copy)]
+pub enum DocxBlockKind {
+    Paragraph,
+    Title,
+    Heading1,
+    Heading2,
+    Heading3,
+    Bullet,
+}
+
+/// A DOCX block: a heading/paragraph/list with one or more runs.
+#[derive(Debug, Clone)]
+pub struct DocxBlock {
+    pub kind: DocxBlockKind,
+    pub runs: Vec<DocxRun>,
+}
+
+/// Horizontal alignment for a DOCX paragraph.
+#[derive(Debug, Clone, Copy)]
+pub enum DocxAlign {
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+/// Formatting to apply to a DOCX paragraph matched by text.
+#[derive(Debug, Clone, Default)]
+pub struct DocxFormat {
+    pub alignment: Option<DocxAlign>,
+    /// Spacing before the paragraph, in twips.
+    pub spacing_before: Option<u32>,
+    /// Spacing after the paragraph, in twips.
+    pub spacing_after: Option<u32>,
+    /// Left indent, in twips.
+    pub indent_left: Option<u32>,
+    /// Right indent, in twips.
+    pub indent_right: Option<u32>,
+}
+
+/// A single spreadsheet cell value (type-inferred on write).
+#[derive(Debug, Clone)]
+pub enum XlsxCellValue {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+}
+
+/// A slide to append to a PPTX deck.
+#[derive(Debug, Clone)]
+pub struct PptxSlideSpec {
+    pub title: String,
+    pub body: Vec<String>,
+}
+
 /// An editable document that supports text replacement and saving.
 ///
 /// The document is loaded in its entirety (all OPC parts) so that
@@ -112,6 +201,93 @@ impl EditableDocument {
             },
             _ => Err(crate::OfficeError::UnsupportedFormat(
                 "set_cell is only supported for XLSX".to_string(),
+            )),
+        }
+    }
+
+    /// Append DOCX blocks (paragraphs/headings/lists) before `</w:body>`.
+    pub fn append_docx_blocks(&mut self, blocks: &[DocxBlock]) -> Result<usize> {
+        match &mut self.inner {
+            EditableInner::Docx(doc) => doc.append_blocks(blocks),
+            _ => Err(crate::OfficeError::UnsupportedFormat(
+                "append_docx_blocks is only supported for DOCX".to_string(),
+            )),
+        }
+    }
+
+    /// Append a DOCX table before `</w:body>`.
+    pub fn append_docx_table(&mut self, rows: &[Vec<String>]) -> Result<usize> {
+        match &mut self.inner {
+            EditableInner::Docx(doc) => doc.append_table(rows),
+            _ => Err(crate::OfficeError::UnsupportedFormat(
+                "append_docx_table is only supported for DOCX".to_string(),
+            )),
+        }
+    }
+
+    /// Delete DOCX paragraphs whose text contains `find`.
+    pub fn delete_docx_paragraphs(&mut self, find: &str) -> Result<usize> {
+        match &mut self.inner {
+            EditableInner::Docx(doc) => doc.delete_paragraphs(find),
+            _ => Err(crate::OfficeError::UnsupportedFormat(
+                "delete_docx_paragraphs is only supported for DOCX".to_string(),
+            )),
+        }
+    }
+
+    /// Format the first DOCX paragraph whose text contains `find`.
+    pub fn format_docx_paragraph(&mut self, find: &str, fmt: &DocxFormat) -> Result<usize> {
+        match &mut self.inner {
+            EditableInner::Docx(doc) => doc.format_paragraph(find, fmt),
+            _ => Err(crate::OfficeError::UnsupportedFormat(
+                "format_docx_paragraph is only supported for DOCX".to_string(),
+            )),
+        }
+    }
+
+    /// Replace text across all XLSX cells (shared strings + inline strings).
+    /// Returns the number of replacements made.
+    pub fn xlsx_replace_text(&mut self, find: &str, replace: &str) -> Result<usize> {
+        match &mut self.inner {
+            EditableInner::Xlsx(doc) => Ok(doc.replace_text(find, replace)?),
+            _ => Err(crate::OfficeError::UnsupportedFormat(
+                "xlsx_replace_text is only supported for XLSX".to_string(),
+            )),
+        }
+    }
+
+    /// Append rows to an XLSX worksheet. `sheet_index` is 0-based.
+    /// Returns the number of rows appended.
+    pub fn append_xlsx_rows(
+        &mut self,
+        sheet_index: usize,
+        rows: &[Vec<XlsxCellValue>],
+    ) -> Result<usize> {
+        match &mut self.inner {
+            EditableInner::Xlsx(doc) => Ok(doc.append_rows(sheet_index, rows)?),
+            _ => Err(crate::OfficeError::UnsupportedFormat(
+                "append_xlsx_rows is only supported for XLSX".to_string(),
+            )),
+        }
+    }
+
+    /// Append slides to a PPTX deck. Returns the number of slides appended.
+    pub fn append_pptx_slides(&mut self, slides: &[PptxSlideSpec]) -> Result<usize> {
+        match &mut self.inner {
+            EditableInner::Pptx(doc) => Ok(doc.append_slides(slides)?),
+            _ => Err(crate::OfficeError::UnsupportedFormat(
+                "append_pptx_slides is only supported for PPTX".to_string(),
+            )),
+        }
+    }
+
+    /// Remove the first PPTX slide whose text contains `find`.
+    /// Returns 1 if a slide was removed, 0 otherwise.
+    pub fn remove_pptx_slide(&mut self, find: &str) -> Result<usize> {
+        match &mut self.inner {
+            EditableInner::Pptx(doc) => Ok(doc.remove_slide(find)?),
+            _ => Err(crate::OfficeError::UnsupportedFormat(
+                "remove_pptx_slide is only supported for PPTX".to_string(),
             )),
         }
     }

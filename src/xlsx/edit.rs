@@ -66,6 +66,202 @@ impl EditableXlsx {
         self.package.write_to(writer)?;
         Ok(())
     }
+
+    /// Replace text in every cell (shared strings + inline strings) of every
+    /// worksheet. Returns the total number of replacements made.
+    pub fn replace_text(&mut self, find: &str, replace: &str) -> Result<usize> {
+        let mut total = 0usize;
+        // Shared strings table.
+        if let Some(part) = self.package.get_part(&PartName::new("/xl/sharedStrings.xml")?) {
+            let xml = String::from_utf8_lossy(part).into_owned();
+            let (new_xml, count) = replace_in_t_elements(&xml, find, replace);
+            if count > 0 {
+                self.package
+                    .set_part(PartName::new("/xl/sharedStrings.xml")?, new_xml.into_bytes());
+                total += count;
+            }
+        }
+        // Worksheet inline strings.
+        for i in 1..=100 {
+            let name = PartName::new(&format!("/xl/worksheets/sheet{i}.xml"))?;
+            let Some(data) = self.package.get_part(&name) else {
+                break;
+            };
+            let xml = String::from_utf8_lossy(data).into_owned();
+            let (new_xml, count) = replace_in_t_elements(&xml, find, replace);
+            if count > 0 {
+                self.package.set_part(name, new_xml.into_bytes());
+                total += count;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Append rows to a worksheet. `sheet_index` is 0-based.
+    /// Returns the number of rows appended.
+    pub fn append_rows(
+        &mut self,
+        sheet_index: usize,
+        rows: &[Vec<crate::edit::XlsxCellValue>],
+    ) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let part_name = PartName::new(&format!("/xl/worksheets/sheet{}.xml", sheet_index + 1))?;
+        let Some(data) = self.package.get_part(&part_name) else {
+            return Err(super::XlsxError::Core(crate::core::Error::MissingPart(
+                part_name.as_str().to_string(),
+            )));
+        };
+        let xml = String::from_utf8_lossy(data).into_owned();
+
+        // Determine the next free row number.
+        let mut max_row = 0u32;
+        let mut scan = &xml[..];
+        while let Some(pos) = scan.find("<row") {
+            let rest = &scan[pos..];
+            let Some(r_start) = rest.find('r') else { break };
+            // Find r="N"
+            let after = &rest[r_start + 1..];
+            let Some(quote) = after.find('"') else { break };
+            let num_start = quote + 1;
+            let Some(num_end) = after[num_start..].find('"') else { break };
+            let num: u32 = after[num_start..num_start + num_end].parse().unwrap_or(0);
+            max_row = max_row.max(num);
+            let Some(next) = scan[pos + 1..].find("<row") else {
+                break;
+            };
+            scan = &scan[pos + 1 + next..];
+        }
+        let start_row = max_row + 1;
+
+        let mut fragment = String::new();
+        for (ri, row) in rows.iter().enumerate() {
+            let row_num = start_row + ri as u32;
+            let mut cells = String::new();
+            for (ci, value) in row.iter().enumerate() {
+                let col = col_letter(ci);
+                let cell_ref = format!("{col}{row_num}");
+                match value {
+                    crate::edit::XlsxCellValue::String(s) => {
+                        let escaped = escape_xml(s);
+                        cells.push_str(&format!(
+                            r#"<c r="{cell_ref}" t="inlineStr"><is><t>{escaped}</t></is></c>"#
+                        ));
+                    },
+                    crate::edit::XlsxCellValue::Number(n) => {
+                        cells.push_str(&format!(r#"<c r="{cell_ref}"><v>{n}</v></c>"#));
+                    },
+                    crate::edit::XlsxCellValue::Boolean(b) => {
+                        let v = if *b { "1" } else { "0" };
+                        cells.push_str(&format!(r#"<c r="{cell_ref}" t="b"><v>{v}</v></c>"#));
+                    },
+                }
+            }
+            fragment.push_str(&format!(r#"<row r="{row_num}">{cells}</row>"#));
+        }
+
+        let new_xml = if let Some(pos) = xml.rfind("</sheetData>") {
+            let mut out = String::with_capacity(xml.len() + fragment.len());
+            out.push_str(&xml[..pos]);
+            out.push_str(&fragment);
+            out.push_str(&xml[pos..]);
+            out
+        } else {
+            xml
+        };
+
+        // Best-effort: extend the <dimension> end reference.
+        let new_xml = extend_dimension(&new_xml, start_row + rows.len().saturating_sub(1) as u32);
+
+        self.package.set_part(part_name, new_xml.into_bytes());
+        Ok(rows.len())
+    }
+}
+
+/// Convert a 0-based column index to spreadsheet letters (0 -> "A").
+fn col_letter(mut index: usize) -> String {
+    let mut letters = String::new();
+    loop {
+        let rem = index % 26;
+        letters.insert(0, (b'A' + rem as u8) as char);
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    letters
+}
+
+/// Extend a `<dimension ref="..."/>` end cell to cover up to `max_row` rows,
+/// keeping the existing end column. No-op if the dimension is not a simple range.
+fn extend_dimension(xml: &str, max_row: u32) -> String {
+    let Some(dim_start) = xml.find("<dimension") else {
+        return xml.to_string();
+    };
+    let Some(dim_end) = xml[dim_start..].find("/>") else {
+        return xml.to_string();
+    };
+    let dim_tag = &xml[dim_start..dim_start + dim_end + 2];
+    let Some(ref_pos) = dim_tag.find("ref=\"") else {
+        return xml.to_string();
+    };
+    let ref_start = ref_pos + 5;
+    let Some(ref_end) = dim_tag[ref_start..].find('"') else {
+        return xml.to_string();
+    };
+    let ref_val = &dim_tag[ref_start..ref_start + ref_end];
+    let Some(colon) = ref_val.find(':') else {
+        return xml.to_string();
+    };
+    let (start_cell, end_cell) = ref_val.split_at(colon);
+    let end_cell = &end_cell[1..];
+    let end_col: String = end_cell.chars().take_while(|c| c.is_ascii_uppercase()).collect();
+    let new_ref = format!("{start_cell}:{end_col}{max_row}");
+    let new_tag = dim_tag.replacen(ref_val, &new_ref, 1);
+    let mut out = String::with_capacity(xml.len());
+    out.push_str(&xml[..dim_start]);
+    out.push_str(&new_tag);
+    out.push_str(&xml[dim_start + dim_end + 2..]);
+    out
+}
+
+/// Replace text within `<t>...</t>` elements of a SpreadsheetML/SharedStrings XML.
+/// Returns the new string and the count of replacements.
+fn replace_in_t_elements(xml: &str, find: &str, replace: &str) -> (String, usize) {
+    let mut result = String::with_capacity(xml.len());
+    let mut count = 0;
+    let mut pos = 0;
+    while pos < xml.len() {
+        if let Some(tag_start) = xml[pos..].find("<t") {
+            let tag_start = pos + tag_start;
+            let Some(tag_end_offset) = xml[tag_start..].find('>') else {
+                result.push_str(&xml[pos..]);
+                break;
+            };
+            let tag_end = tag_start + tag_end_offset + 1;
+            if xml[tag_start..tag_end].ends_with("/>") {
+                result.push_str(&xml[pos..tag_end]);
+                pos = tag_end;
+                continue;
+            }
+            let Some(close_offset) = xml[tag_end..].find("</t>") else {
+                result.push_str(&xml[pos..]);
+                break;
+            };
+            let close_start = tag_end + close_offset;
+            let text_content = &xml[tag_end..close_start];
+            count += text_content.matches(find).count();
+            let replaced = text_content.replace(find, replace);
+            result.push_str(&xml[pos..tag_end]);
+            result.push_str(&replaced);
+            pos = close_start;
+        } else {
+            result.push_str(&xml[pos..]);
+            break;
+        }
+    }
+    (result, count)
 }
 
 /// Parse a cell reference like "A1" into (row_1based, col_letters).

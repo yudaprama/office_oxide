@@ -220,6 +220,43 @@ impl Relationships {
         &self.rels
     }
 
+    /// Append a relationship and return its index.
+    pub(crate) fn add(&mut self, rel: Relationship) -> usize {
+        let i = self.rels.len();
+        self.by_id.insert(rel.id.clone(), i);
+        self.by_type.entry(rel.rel_type.clone()).or_default().push(i);
+        self.rels.push(rel);
+        i
+    }
+
+    /// Remove the relationship with the given ID. Returns `true` if removed.
+    pub(crate) fn remove_by_id(&mut self, id: &str) -> bool {
+        if let Some(&i) = self.by_id.get(id) {
+            let rel = self.rels.remove(i);
+            self.by_id.remove(&rel.id);
+            if let Some(indices) = self.by_type.get_mut(&rel.rel_type) {
+                indices.retain(|&x| x != i);
+            }
+            // Reindex after removal (indices above `i` shifted down by one).
+            for v in self.by_id.values_mut() {
+                if *v > i {
+                    *v -= 1;
+                }
+            }
+            for indices in self.by_type.values_mut() {
+                indices.retain(|&x| x != i);
+                for v in indices.iter_mut() {
+                    if *v > i {
+                        *v -= 1;
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Resolve an internal relationship target relative to a source part name.
     ///
     /// For package-level relationships (source is root), pass a source of `PartName::new("/").ok()`
