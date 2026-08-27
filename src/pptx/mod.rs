@@ -307,10 +307,7 @@ impl crate::core::OfficeDocument for PptxDocument {
 /// Walk slide shapes (recursing into groups) and resolve every picture's
 /// `embed_rid` to its package-relative image path (recorded in `paths`).
 /// Pictures whose relationship id is unknown are left with `media_path = None`.
-fn resolve_picture_media(
-    shapes: &mut [Shape],
-    paths: &std::collections::HashMap<String, String>,
-) {
+fn resolve_picture_media(shapes: &mut [Shape], paths: &std::collections::HashMap<String, String>) {
     for shape in shapes {
         match shape {
             Shape::Picture(pic) => {
@@ -319,9 +316,9 @@ fn resolve_picture_media(
                         pic.media_path = Some(mp.clone());
                     }
                 }
-            }
+            },
             Shape::Group(grp) => resolve_picture_media(&mut grp.children, paths),
-            _ => {}
+            _ => {},
         }
     }
 }

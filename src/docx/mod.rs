@@ -727,7 +727,7 @@ fn resolve_drawing_media(
                                     }
                                 }
                             }
-                        }
+                        },
                         ParagraphContent::Hyperlink(hl) => {
                             for run in &mut hl.runs {
                                 for rc in &mut run.content {
@@ -738,17 +738,17 @@ fn resolve_drawing_media(
                                     }
                                 }
                             }
-                        }
+                        },
                     }
                 }
-            }
+            },
             BlockElement::Table(table) => {
                 for row in &mut table.rows {
                     for cell in &mut row.cells {
                         resolve_drawing_media(&mut cell.content, paths);
                     }
                 }
-            }
+            },
         }
     }
 }

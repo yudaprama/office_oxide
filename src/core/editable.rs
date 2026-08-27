@@ -96,12 +96,7 @@ impl EditablePackage {
 
     /// Add a relationship for `source` (a part name; use `/` for the package
     /// root). Returns the newly assigned rId.
-    pub fn add_relationship(
-        &mut self,
-        source: &PartName,
-        rel_type: &str,
-        target: &str,
-    ) -> String {
+    pub fn add_relationship(&mut self, source: &PartName, rel_type: &str, target: &str) -> String {
         let next = self.next_rid_all();
         let id = format!("rId{next}");
         let rel = super::relationships::Relationship {

@@ -72,7 +72,10 @@ impl EditableXlsx {
     pub fn replace_text(&mut self, find: &str, replace: &str) -> Result<usize> {
         let mut total = 0usize;
         // Shared strings table.
-        if let Some(part) = self.package.get_part(&PartName::new("/xl/sharedStrings.xml")?) {
+        if let Some(part) = self
+            .package
+            .get_part(&PartName::new("/xl/sharedStrings.xml")?)
+        {
             let xml = String::from_utf8_lossy(part).into_owned();
             let (new_xml, count) = replace_in_t_elements(&xml, find, replace);
             if count > 0 {
@@ -125,7 +128,9 @@ impl EditableXlsx {
             let after = &rest[r_start + 1..];
             let Some(quote) = after.find('"') else { break };
             let num_start = quote + 1;
-            let Some(num_end) = after[num_start..].find('"') else { break };
+            let Some(num_end) = after[num_start..].find('"') else {
+                break;
+            };
             let num: u32 = after[num_start..num_start + num_end].parse().unwrap_or(0);
             max_row = max_row.max(num);
             let Some(next) = scan[pos + 1..].find("<row") else {
@@ -216,7 +221,10 @@ fn extend_dimension(xml: &str, max_row: u32) -> String {
     };
     let (start_cell, end_cell) = ref_val.split_at(colon);
     let end_cell = &end_cell[1..];
-    let end_col: String = end_cell.chars().take_while(|c| c.is_ascii_uppercase()).collect();
+    let end_col: String = end_cell
+        .chars()
+        .take_while(|c| c.is_ascii_uppercase())
+        .collect();
     let new_ref = format!("{start_cell}:{end_col}{max_row}");
     let new_tag = dim_tag.replacen(ref_val, &new_ref, 1);
     let mut out = String::with_capacity(xml.len());

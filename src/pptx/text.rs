@@ -232,8 +232,12 @@ fn collect_markdown_entries(
                     if !alt.is_empty() {
                         let url = match (baseurl, &pic.media_path) {
                             (Some(b), Some(mp)) => {
-                                format!("{}/{}", b.trim_end_matches('/'), mp.trim_start_matches('/'))
-                            }
+                                format!(
+                                    "{}/{}",
+                                    b.trim_end_matches('/'),
+                                    mp.trim_start_matches('/')
+                                )
+                            },
                             _ => String::new(),
                         };
                         entries.push((pic.position.clone(), format!("![{alt}]({url})")));

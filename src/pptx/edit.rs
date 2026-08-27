@@ -85,7 +85,8 @@ impl EditablePptx {
         }
         let mut buf = Cursor::new(Vec::new());
         w.write_to(&mut buf)?;
-        let temp = crate::core::editable::EditablePackage::from_reader(Cursor::new(buf.into_inner()))?;
+        let temp =
+            crate::core::editable::EditablePackage::from_reader(Cursor::new(buf.into_inner()))?;
 
         let presentation_part = PartName::new("/ppt/presentation.xml")?;
         let max_existing = max_slide_index(&self.package);
@@ -151,7 +152,9 @@ impl EditablePptx {
             out
         } else {
             // No sldIdLst: create one right after the <p:presentation ...> tag.
-            let open = xml.find("<p:presentation").and_then(|s| xml[s..].find('>').map(|o| s + o + 1));
+            let open = xml
+                .find("<p:presentation")
+                .and_then(|s| xml[s..].find('>').map(|o| s + o + 1));
             let open = open.unwrap_or(0);
             let mut out = String::with_capacity(xml.len() + entry.len() + 40);
             out.push_str(&xml[..open]);
@@ -231,9 +234,13 @@ fn next_sld_id(presentation_xml: &str) -> u32 {
     let mut scan = presentation_xml;
     while let Some(pos) = scan.find("<p:sldId") {
         let rest = &scan[pos..];
-        let Some(id_pos) = rest.find("id=\"") else { break };
+        let Some(id_pos) = rest.find("id=\"") else {
+            break;
+        };
         let num_start = id_pos + 4;
-        let Some(num_end) = rest[num_start..].find('"') else { break };
+        let Some(num_end) = rest[num_start..].find('"') else {
+            break;
+        };
         if let Ok(num) = rest[num_start..num_start + num_end].parse::<u32>() {
             max = max.max(num);
         }
@@ -281,9 +288,13 @@ fn slide_text_contains(slide_xml: &str, find: &str) -> bool {
     let mut pos = 0;
     while let Some(ts) = slide_xml[pos..].find("<a:t") {
         let ts = pos + ts;
-        let Some(te) = slide_xml[ts..].find('>') else { break };
+        let Some(te) = slide_xml[ts..].find('>') else {
+            break;
+        };
         let te = ts + te + 1;
-        let Some(ce) = slide_xml[te..].find("</a:t>") else { break };
+        let Some(ce) = slide_xml[te..].find("</a:t>") else {
+            break;
+        };
         let ce = te + ce;
         text.push_str(&slide_xml[te..ce]);
         pos = ce;

@@ -224,7 +224,10 @@ impl Relationships {
     pub(crate) fn add(&mut self, rel: Relationship) -> usize {
         let i = self.rels.len();
         self.by_id.insert(rel.id.clone(), i);
-        self.by_type.entry(rel.rel_type.clone()).or_default().push(i);
+        self.by_type
+            .entry(rel.rel_type.clone())
+            .or_default()
+            .push(i);
         self.rels.push(rel);
         i
     }

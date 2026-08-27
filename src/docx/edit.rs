@@ -130,7 +130,11 @@ impl EditableDocx {
 
     /// Apply formatting to the first paragraph whose visible text contains `find`.
     /// Returns 1 if a paragraph was formatted, 0 otherwise.
-    pub fn format_paragraph(&mut self, find: &str, fmt: &crate::edit::DocxFormat) -> crate::Result<usize> {
+    pub fn format_paragraph(
+        &mut self,
+        find: &str,
+        fmt: &crate::edit::DocxFormat,
+    ) -> crate::Result<usize> {
         let Some(data) = self.package.get_part(&self.main_part) else {
             return Ok(0);
         };
@@ -240,7 +244,9 @@ fn generate_docx_table(rows: &[Vec<String>]) -> crate::Result<String> {
 
 /// Extract the children of `<w:body>` (everything between the tags) as a string.
 fn extract_body_children(xml: &str) -> &str {
-    let start = xml.find("<w:body").and_then(|s| xml[s..].find('>').map(|o| s + o + 1));
+    let start = xml
+        .find("<w:body")
+        .and_then(|s| xml[s..].find('>').map(|o| s + o + 1));
     let end = xml.rfind("</w:body>");
     match (start, end) {
         (Some(s), Some(e)) if e > s => &xml[s..e],
@@ -313,7 +319,11 @@ fn count_paragraph_removals(old_xml: &str, new_xml: &str) -> usize {
 
 /// Format the first `<w:p>` whose text contains `find` by injecting/merging a
 /// `<w:pPr>` with the requested properties.
-fn format_paragraph_containing(xml: &str, find: &str, fmt: &crate::edit::DocxFormat) -> Option<String> {
+fn format_paragraph_containing(
+    xml: &str,
+    find: &str,
+    fmt: &crate::edit::DocxFormat,
+) -> Option<String> {
     let mut result = String::with_capacity(xml.len());
     let mut pos = 0;
     let mut formatted = false;
@@ -404,11 +414,7 @@ fn format_paragraph_containing(xml: &str, find: &str, fmt: &crate::edit::DocxFor
         result.push_str(&xml[pos..close_end]);
         pos = close_end;
     }
-    if formatted {
-        Some(result)
-    } else {
-        None
-    }
+    if formatted { Some(result) } else { None }
 }
 
 /// Replace text within `<w:t>...</w:t>` elements in a WML XML string.

@@ -330,7 +330,7 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String, baseurl: Option<&st
             out.push_str(b.trim_end_matches('/'));
             out.push('/');
             out.push_str(mp.trim_start_matches('/'));
-        }
+        },
         _ => out.push_str(&drawing.relationship_id),
     }
     out.push(')');
