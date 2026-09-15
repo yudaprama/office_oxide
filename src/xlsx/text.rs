@@ -83,27 +83,39 @@ impl XlsxDocument {
         parts.join("\n\n")
     }
 
-    /// Convert to markdown, appending the worksheets' anchored pictures as
+    /// Convert to markdown, prepending the worksheets' anchored pictures as
     /// servable image references rooted at `baseurl` (e.g. `"/office-files"
-    /// + `/xl/media/sheet1-img0.png`), mirroring the DOCX renderer. Sheets
-    /// without pictures add nothing, so the output of [`Self::to_markdown`]
-    /// is unchanged when the workbook has no embedded images.
+    /// + `/xl/media/sheet1-img0.png`), mirroring the DOCX renderer. The
+    /// picture section comes FIRST — consumers cap markdown length (the
+    /// read tool truncates at 60k chars) and the sheet tables routinely
+    /// exceed that on data workbooks, which would hide an appended section.
+    /// Sheets without pictures add nothing, so the output of
+    /// [`Self::to_markdown`] is unchanged when the workbook has no
+    /// embedded images.
     pub fn to_markdown_with_baseurl(&self, baseurl: &str) -> String {
-        let mut md = self.to_markdown();
         let base = baseurl.trim_end_matches('/');
+        let mut pictures = String::new();
         for (si, ws) in self.worksheets.iter().enumerate() {
             if ws.images.is_empty() {
                 continue;
             }
-            md.push_str(&format!("\n\n## {} — pictures\n", ws.name));
+            pictures.push_str(&format!("\n## {} — pictures\n", ws.name));
             for (i, pic) in ws.images.iter().enumerate() {
                 let alt = pic.alt_text.as_deref().unwrap_or("");
-                md.push_str(&format!(
+                pictures.push_str(&format!(
                     "\n![{alt}]({base}/xl/media/sheet{si}-img{i}.{})",
                     pic.format
                 ));
             }
         }
+        if pictures.is_empty() {
+            return self.to_markdown();
+        }
+        let mut md = String::with_capacity(pictures.len() + 64 + self.to_markdown().len());
+        md.push_str("# Embedded pictures\n");
+        md.push_str(&pictures);
+        md.push_str("\n\n");
+        md.push_str(&self.to_markdown());
         md
     }
 
@@ -376,13 +388,18 @@ mod tests {
     }
 
     #[test]
-    fn markdown_with_baseurl_lists_pictures() {
+    fn markdown_with_baseurl_lists_pictures_first() {
         let doc = doc_with_pictures();
         let md = doc.to_markdown_with_baseurl("/office-files/f1");
         assert!(
             md.contains("![foto KTP](/office-files/f1/xl/media/sheet0-img0.png)"),
             "{md}"
         );
+        // Pictures must come before the sheet tables so a length-capped
+        // consumer never truncates them away.
+        let pic = md.find("Embedded pictures").expect("pictures heading");
+        let table = md.find("## data").expect("sheet heading");
+        assert!(pic < table, "{md}");
     }
 
     #[test]
