@@ -160,6 +160,21 @@ pub struct Document {
     inner: DocumentInner,
 }
 
+/// One embedded raster image materialised by the format parser (XLSX
+/// worksheet picture or DOCX image part). `data` holds the raw image-part
+/// bytes; `format` is the lowercase file extension (e.g. `"png"`).
+#[derive(Debug, Clone)]
+pub struct EmbeddedImage {
+    /// Image bytes.
+    pub data: Vec<u8>,
+    /// Lowercase file extension (`"png"`, `"jpeg"`, ...).
+    pub format: String,
+    /// Alt-text when the format carries it (XLSX `<xdr:cNvPr descr=…>`).
+    pub alt_text: Option<String>,
+    /// Human-readable where the image is anchored in the document.
+    pub locator: String,
+}
+
 enum DocumentInner {
     Docx(Box<docx::DocxDocument>),
     Xlsx(Box<xlsx::XlsxDocument>),
@@ -346,12 +361,58 @@ impl Document {
     pub fn to_markdown_with_baseurl(&self, baseurl: Option<&str>) -> String {
         match &self.inner {
             DocumentInner::Docx(doc) => doc.to_markdown_with_baseurl(baseurl),
-            DocumentInner::Xlsx(doc) => doc.to_markdown(),
+            DocumentInner::Xlsx(doc) => match baseurl {
+                Some(base) => doc.to_markdown_with_baseurl(base),
+                None => doc.to_markdown(),
+            },
             DocumentInner::Pptx(doc) => doc.to_markdown_with_baseurl(baseurl),
             DocumentInner::Doc(doc) => doc.to_markdown(),
             DocumentInner::Xls(doc) => doc.to_markdown(),
             DocumentInner::Ppt(doc) => doc.to_markdown(),
         }
+    }
+
+    /// Extract every embedded raster image the format parsers materialise:
+    /// XLSX worksheet pictures and DOCX document image parts. PPTX media and
+    /// the legacy binary formats yield empty vectors. Returns raw bytes plus
+    /// a lowercase format extension so callers can store/serve each image
+    /// without re-opening the archive.
+    pub fn embedded_images(&self) -> Vec<EmbeddedImage> {
+        let mut out = Vec::new();
+        match &self.inner {
+            DocumentInner::Docx(doc) => {
+                let mut ids: Vec<&String> = doc.images.keys().collect();
+                ids.sort(); // deterministic order across HashMap iteration
+                for id in ids {
+                    if let Some((data, ext)) = doc.images.get(id) {
+                        let format = ext
+                            .clone()
+                            .unwrap_or_else(|| "png".to_string())
+                            .to_ascii_lowercase();
+                        out.push(EmbeddedImage {
+                            data: data.clone(),
+                            format,
+                            alt_text: None,
+                            locator: id.clone(),
+                        });
+                    }
+                }
+            }
+            DocumentInner::Xlsx(doc) => {
+                for (si, ws) in doc.worksheets.iter().enumerate() {
+                    for (i, pic) in ws.images.iter().enumerate() {
+                        out.push(EmbeddedImage {
+                            data: pic.data.clone(),
+                            format: pic.format.clone(),
+                            alt_text: pic.alt_text.clone(),
+                            locator: format!("{} — sheet {} image {}", ws.name, si + 1, i + 1),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
     }
 
     /// Convert to an HTML fragment.

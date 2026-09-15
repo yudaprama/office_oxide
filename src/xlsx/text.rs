@@ -83,6 +83,30 @@ impl XlsxDocument {
         parts.join("\n\n")
     }
 
+    /// Convert to markdown, appending the worksheets' anchored pictures as
+    /// servable image references rooted at `baseurl` (e.g. `"/office-files"
+    /// + `/xl/media/sheet1-img0.png`), mirroring the DOCX renderer. Sheets
+    /// without pictures add nothing, so the output of [`Self::to_markdown`]
+    /// is unchanged when the workbook has no embedded images.
+    pub fn to_markdown_with_baseurl(&self, baseurl: &str) -> String {
+        let mut md = self.to_markdown();
+        let base = baseurl.trim_end_matches('/');
+        for (si, ws) in self.worksheets.iter().enumerate() {
+            if ws.images.is_empty() {
+                continue;
+            }
+            md.push_str(&format!("\n\n## {} — pictures\n", ws.name));
+            for (i, pic) in ws.images.iter().enumerate() {
+                let alt = pic.alt_text.as_deref().unwrap_or("");
+                md.push_str(&format!(
+                    "\n![{alt}]({base}/xl/media/sheet{si}-img{i}.{})",
+                    pic.format
+                ));
+            }
+        }
+        md
+    }
+
     /// Convert specific sheet to markdown.
     pub fn sheet_to_markdown(&self, sheet_index: usize) -> Option<String> {
         let ws = self.worksheets.get(sheet_index)?;
@@ -313,6 +337,61 @@ fn csv_escape(field: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xlsx::worksheet::{Worksheet, WorksheetPicture};
+    use crate::xlsx::{SharedStringTable, WorkbookInfo, XlsxDocument};
+
+    fn doc_with_pictures() -> XlsxDocument {
+        XlsxDocument {
+            workbook: WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: vec![Worksheet {
+                name: "data".to_string(),
+                dimension: None,
+                rows: Vec::new(),
+                images: vec![WorksheetPicture {
+                    data: vec![0u8],
+                    format: "png".to_string(),
+                    x_emu: 0,
+                    y_emu: 0,
+                    cx_emu: 1,
+                    cy_emu: 1,
+                    alt_text: Some("foto KTP".to_string()),
+                }],
+                merged_cells: Vec::new(),
+                hyperlinks: Vec::new(),
+                page_setup: None,
+                text_shapes: Vec::new(),
+            }],
+            shared_strings: SharedStringTable { strings: Vec::new() },
+            styles: None,
+            theme: None,
+            chart_text: Vec::new(),
+            embedded_fonts: Vec::new(),
+            styles_data: None,
+            theme_data: None,
+        }
+    }
+
+    #[test]
+    fn markdown_with_baseurl_lists_pictures() {
+        let doc = doc_with_pictures();
+        let md = doc.to_markdown_with_baseurl("/office-files/f1");
+        assert!(
+            md.contains("![foto KTP](/office-files/f1/xl/media/sheet0-img0.png)"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn markdown_without_baseurl_omits_pictures() {
+        let doc = doc_with_pictures();
+        assert!(!doc.to_markdown().contains("pictures"));
+    }
+
+    #[test]
 
     #[test]
     fn csv_escape_plain() {
