@@ -551,6 +551,9 @@ mod tests {
                 hyperlinks: Vec::new(),
                 page_setup: None,
                 text_shapes: Vec::new(),
+                comments: Vec::new(),
+                conditional_formats: Vec::new(),
+                data_validations: Vec::new(),
             }],
             shared_strings: SharedStringTable { strings: Vec::new() },
             styles: None,
@@ -558,6 +561,10 @@ mod tests {
             chart_text: Vec::new(),
             embedded_fonts: Vec::new(),
             styles_data: None,
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            unreadable_sheets: Vec::new(),
             theme_data: None,
         }
     }
