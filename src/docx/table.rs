@@ -1,7 +1,7 @@
 use crate::core::units::Twip;
 
 use super::document::BlockElement;
-use super::formatting::Justification;
+use super::formatting::{Justification, TableBorders};
 
 /// A table element (`w:tbl`).
 #[derive(Debug, Clone)]
@@ -41,6 +41,38 @@ pub struct TableProperties {
     pub justification: Option<Justification>,
     /// Applied table style ID.
     pub style_id: Option<String>,
+    /// Table border edges (`w:tblBorders`).
+    pub borders: Option<TableBorders>,
+    /// Default cell margins (`w:tblCellMar`), in twips.
+    pub cell_margins: Option<CellMargins>,
+    /// Table indent from the left margin (`w:tblInd`), in twips.
+    pub indent: Option<Twip>,
+    /// Accessibility caption (`w:tblCaption`).
+    pub caption: Option<String>,
+}
+
+/// Cell margins from `w:tblCellMar` / `w:tcMar`, in twips.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CellMargins {
+    /// Top margin.
+    pub top: Option<i32>,
+    /// Bottom margin.
+    pub bottom: Option<i32>,
+    /// Left (start) margin.
+    pub left: Option<i32>,
+    /// Right (end) margin.
+    pub right: Option<i32>,
+}
+
+/// How a `w:trHeight` value is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowHeightRule {
+    /// Height is a minimum; the row grows to fit content.
+    AtLeast,
+    /// Height is fixed.
+    Exact,
+    /// Height is determined by content.
+    Auto,
 }
 
 /// Table row properties (`w:trPr`).
@@ -48,6 +80,12 @@ pub struct TableProperties {
 pub struct TableRowProperties {
     /// Whether this row is a table header row.
     pub is_header: bool,
+    /// Row height from `w:trHeight`, in twips.
+    pub height: Option<i32>,
+    /// How `height` is applied.
+    pub height_rule: Option<RowHeightRule>,
+    /// `<w:cantSplit/>` — the row may not break across pages.
+    pub cant_split: bool,
 }
 
 /// Table cell properties (`w:tcPr`).
@@ -59,8 +97,33 @@ pub struct TableCellProperties {
     pub vertical_merge: Option<MergeType>,
     /// Horizontal grid span (number of columns spanned).
     pub grid_span: Option<u32>,
-    /// Cell shading/background.
-    pub shading: Option<Shading>,
+    /// Cell shading/background. Boxed: rare on real cells in a large
+    /// table — `Option<T>` reserves `size_of(T)` even when `None`.
+    pub shading: Option<Box<Shading>>,
+    /// Cell border edges (`w:tcBorders`). Boxed: rare on real cells in a
+    /// large table.
+    pub borders: Option<Box<TableBorders>>,
+    /// Vertical alignment of cell content (`w:vAlign`).
+    pub v_align: Option<CellVAlign>,
+    /// Text flow direction (`w:textDirection`).
+    pub text_direction: Option<String>,
+    /// Per-cell margin overrides (`w:tcMar`), in twips.
+    pub margins: Option<CellMargins>,
+    /// `true` when the cell carries `<w:cellDel>` — deleted via tracked
+    /// changes, pending acceptance. Mirrors the policy already applied to
+    /// run-level `w:del`: excluded from the accepted view.
+    pub deleted: bool,
+}
+
+/// Vertical alignment of a cell's content (`w:vAlign`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellVAlign {
+    /// Align to the top of the cell.
+    Top,
+    /// Center vertically.
+    Center,
+    /// Align to the bottom of the cell.
+    Bottom,
 }
 
 /// Width specification for tables/cells.
@@ -103,4 +166,33 @@ pub struct Shading {
     pub color: Option<String>,
     /// Shading pattern value.
     pub pattern: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `TableCellProperties`'s `shading`/
+    /// `borders` must stay boxed. `TableCellProperties` was 536 bytes
+    /// before this fix (dominated by an unboxed `Shading` + `TableBorders`
+    /// pair), and `TableCell` (which every cell in a large table pays for)
+    /// was 560 bytes. Headroom above the measured post-fix sizes (96B /
+    /// 120B) keeps this from being flaky on an unrelated new field, while
+    /// still catching the actual regression: a large struct un-boxed back
+    /// into `Option<T>`.
+    #[test]
+    fn test_table_cell_properties_size_stays_boxed() {
+        assert!(
+            std::mem::size_of::<TableCellProperties>() <= 200,
+            "TableCellProperties grew to {} bytes — check shading/borders \
+             are still Option<Box<T>>, not Option<T>",
+            std::mem::size_of::<TableCellProperties>()
+        );
+        assert!(
+            std::mem::size_of::<TableCell>() <= 250,
+            "TableCell grew to {} bytes — a TableCellProperties field \
+             regression would show up here too",
+            std::mem::size_of::<TableCell>()
+        );
+    }
 }

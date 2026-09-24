@@ -68,10 +68,10 @@ impl StyleSheet {
         loop {
             match reader.read_event()? {
                 Event::Start(ref e) => match e.local_name().as_ref() {
-                    b"docDefaults" => {
+                    "docDefaults" => {
                         sheet.doc_defaults = Some(parse_doc_defaults(&mut reader)?);
                     },
-                    b"style" => {
+                    "style" => {
                         if let Some(style) = parse_style(&mut reader, e)? {
                             sheet.styles.insert(style.style_id.clone(), style);
                         }
@@ -83,6 +83,123 @@ impl StyleSheet {
             }
         }
         Ok(sheet)
+    }
+
+    /// Return the inheritance chain for `style_id`, **root ancestor first**,
+    /// so callers can overlay each style in turn and have the most specific
+    /// one win. Cycles and pathological `w:basedOn` chains are cut off at 20
+    /// links.
+    fn chain(&self, style_id: &str) -> Vec<&Style> {
+        let mut out = Vec::new();
+        let mut current = self.styles.get(style_id);
+        while let Some(style) = current {
+            if out.len() >= 20 {
+                break;
+            }
+            out.push(style);
+            current = style.based_on.as_deref().and_then(|id| self.styles.get(id));
+        }
+        out.reverse();
+        out
+    }
+
+    /// Fold the effective run formatting for a run: document defaults, then
+    /// the paragraph style chain's run properties, then the character style
+    /// chain, then the run's own `w:rPr`. Later stages win field by field.
+    ///
+    /// Without this, only direct `w:rPr` reached the IR — so a document that
+    /// puts all of its formatting in styles (which is what Word's built-in
+    /// styles and every template do) read back as unformatted text.
+    pub fn effective_run_properties(
+        &self,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&RunProperties>,
+    ) -> RunProperties {
+        let mut out = self
+            .doc_defaults
+            .as_ref()
+            .and_then(|d| d.run_properties.clone())
+            .unwrap_or_default();
+        if let Some(pid) = paragraph_style_id {
+            for style in self.chain(pid) {
+                if let Some(rp) = style.run_properties.as_ref() {
+                    out.overlay(rp);
+                }
+            }
+        }
+        // `w:rStyle` on the run names a character style, which sits above
+        // the paragraph style but below the run's own direct formatting.
+        if let Some(cid) = direct.and_then(|d| d.style_id.as_deref()) {
+            for style in self.chain(cid) {
+                if let Some(rp) = style.run_properties.as_ref() {
+                    out.overlay(rp);
+                }
+            }
+        }
+        if let Some(d) = direct {
+            out.overlay(d);
+        }
+        out
+    }
+
+    /// Whether a run is hidden (`<w:vanish/>`) once document defaults, the
+    /// paragraph style chain, the run's character style and its own
+    /// `w:rPr` are folded together — the same precedence as
+    /// [`Self::effective_run_properties`], without materialising the whole
+    /// property set for renderers that only need this one bit.
+    pub fn effective_hidden(
+        &self,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&RunProperties>,
+    ) -> bool {
+        let mut hidden = self
+            .doc_defaults
+            .as_ref()
+            .and_then(|d| d.run_properties.as_ref())
+            .and_then(|rp| rp.hidden);
+        let chain_hidden = |sid: &str| {
+            self.chain(sid)
+                .into_iter()
+                .rev()
+                .find_map(|style| style.run_properties.as_ref().and_then(|rp| rp.hidden))
+        };
+        if let Some(h) = paragraph_style_id.and_then(chain_hidden) {
+            hidden = Some(h);
+        }
+        if let Some(h) = direct
+            .and_then(|d| d.style_id.as_deref())
+            .and_then(chain_hidden)
+        {
+            hidden = Some(h);
+        }
+        if let Some(h) = direct.and_then(|d| d.hidden) {
+            hidden = Some(h);
+        }
+        hidden.unwrap_or(false)
+    }
+
+    /// Fold the effective paragraph formatting: document defaults, then the
+    /// style chain, then the paragraph's own `w:pPr`.
+    pub fn effective_paragraph_properties(
+        &self,
+        direct: Option<&ParagraphProperties>,
+    ) -> ParagraphProperties {
+        let mut out = self
+            .doc_defaults
+            .as_ref()
+            .and_then(|d| d.paragraph_properties.clone())
+            .unwrap_or_default();
+        if let Some(pid) = direct.and_then(|d| d.style_id.as_deref()) {
+            for style in self.chain(pid) {
+                if let Some(pp) = style.paragraph_properties.as_ref() {
+                    out.overlay(pp);
+                }
+            }
+        }
+        if let Some(d) = direct {
+            out.overlay(d);
+        }
+        out
     }
 
     /// Resolve the effective outline level for a given style ID, walking the inheritance chain.
@@ -112,11 +229,11 @@ fn parse_doc_defaults(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Res
         match reader.read_event()? {
             Event::Start(ref e) => {
                 match e.local_name().as_ref() {
-                    b"rPrDefault" => {
+                    "rPrDefault" => {
                         // contains w:rPr
                         defaults.run_properties = parse_nested_rpr(reader)?;
                     },
-                    b"pPrDefault" => {
+                    "pPrDefault" => {
                         defaults.paragraph_properties = parse_nested_ppr(reader)?;
                     },
                     _ => {
@@ -124,7 +241,7 @@ fn parse_doc_defaults(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Res
                     },
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"docDefaults" => {
+            Event::End(ref e) if e.local_name().as_ref() == "docDefaults" => {
                 break;
             },
             Event::Eof => break,
@@ -143,13 +260,13 @@ fn parse_nested_rpr(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"rPr" {
+                if e.local_name().as_ref() == "rPr" {
                     result = Some(parse_run_properties_fast(reader)?);
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"rPrDefault" => {
+            Event::End(ref e) if e.local_name().as_ref() == "rPrDefault" => {
                 break;
             },
             Event::Eof => break,
@@ -168,13 +285,13 @@ fn parse_nested_ppr(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"pPr" {
+                if e.local_name().as_ref() == "pPr" {
                     result = Some(parse_paragraph_properties_fast(reader)?);
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"pPrDefault" => {
+            Event::End(ref e) if e.local_name().as_ref() == "pPrDefault" => {
                 break;
             },
             Event::Eof => break,
@@ -188,11 +305,11 @@ fn parse_style(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<Style>> {
-    let style_id = match xml::optional_attr_str(start, b"w:styleId")? {
+    let style_id = match xml::optional_attr_str(start, "w:styleId")? {
         Some(id) => id.into_owned(),
         None => return Ok(None),
     };
-    let style_type = match xml::optional_attr_str(start, b"w:type")? {
+    let style_type = match xml::optional_attr_str(start, "w:type")? {
         Some(ref t) => match t.as_ref() {
             "paragraph" => StyleType::Paragraph,
             "character" => StyleType::Character,
@@ -211,22 +328,22 @@ fn parse_style(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"name" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "name" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         name = Some(val.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"basedOn" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "basedOn" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         based_on = Some(val.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"rPr" => {
+                "rPr" => {
                     run_properties = Some(parse_run_properties_fast(reader)?);
                 },
-                b"pPr" => {
+                "pPr" => {
                     paragraph_properties = Some(parse_paragraph_properties_fast(reader)?);
                 },
                 _ => {
@@ -234,19 +351,19 @@ fn parse_style(
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"name" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "name" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         name = Some(val.into_owned());
                     }
                 },
-                b"basedOn" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "basedOn" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         based_on = Some(val.into_owned());
                     }
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"style" => {
+            Event::End(ref e) if e.local_name().as_ref() == "style" => {
                 break;
             },
             Event::Eof => break,
@@ -301,14 +418,14 @@ mod tests {
 </w:styles>"#;
 
     #[test]
-    fn parse_stylesheet() {
+    fn test_parse_stylesheet() {
         let sheet = StyleSheet::parse(SAMPLE_STYLES).unwrap();
         assert_eq!(sheet.styles.len(), 3);
         assert!(sheet.doc_defaults.is_some());
     }
 
     #[test]
-    fn parse_doc_defaults_font_size() {
+    fn test_parse_doc_defaults_font_size() {
         let sheet = StyleSheet::parse(SAMPLE_STYLES).unwrap();
         let defaults = sheet.doc_defaults.as_ref().unwrap();
         let rp = defaults.run_properties.as_ref().unwrap();
@@ -316,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_heading1_style() {
+    fn test_parse_heading1_style() {
         let sheet = StyleSheet::parse(SAMPLE_STYLES).unwrap();
         let h1 = sheet.styles.get("Heading1").unwrap();
         assert_eq!(h1.name.as_deref(), Some("heading 1"));
@@ -332,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_outline_level() {
+    fn test_resolve_outline_level() {
         let sheet = StyleSheet::parse(SAMPLE_STYLES).unwrap();
         assert_eq!(sheet.resolve_outline_level("Heading1"), Some(0));
         assert_eq!(sheet.resolve_outline_level("Normal"), None);

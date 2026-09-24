@@ -9,9 +9,20 @@ pub enum XlsError {
     #[error("invalid BIFF record: {0}")]
     InvalidRecord(String),
 
+    /// The file is encrypted or password-protected. Extraction cannot
+    /// proceed, and returning an empty string with `Ok` told the caller the
+    /// file simply had no text.
+    #[error("file is encrypted or password-protected")]
+    Encrypted,
+
     /// The file uses a BIFF version that is not supported.
+    ///
+    /// Carries a description of the detected format rather than a bare
+    /// number, so the caller can tell a recognised-but-unsupported legacy
+    /// file from genuine corruption — the same shape as
+    /// `DocError::UnsupportedVersion` for Word 6.0/95.
     #[error("unsupported BIFF version: {0}")]
-    UnsupportedVersion(u16),
+    UnsupportedVersion(String),
 
     /// A required CFB stream is absent from the file.
     #[error("missing stream: {0}")]

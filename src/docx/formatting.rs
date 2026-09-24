@@ -26,6 +26,23 @@ pub struct RunProperties {
     pub vertical_align: Option<VerticalAlign>,
     /// Character style ID.
     pub style_id: Option<String>,
+    /// All-caps toggle (`<w:caps/>`).
+    pub caps: Option<bool>,
+    /// Small-caps toggle (`<w:smallCaps/>`).
+    pub small_caps: Option<bool>,
+    /// Character spacing from `<w:spacing w:val="N"/>` inside `w:rPr`.
+    /// Signed, in the same units the writer emits (twentieths of a point).
+    pub char_spacing: Option<i32>,
+    /// Run shading fill from `<w:shd w:fill="RRGGBB"/>` inside `w:rPr`.
+    /// The writer uses this (not `<w:highlight>`) to encode
+    /// `TextSpan::highlight`, so reading it back is what closes the
+    /// write→read loop for highlighted text.
+    pub shading_fill: Option<String>,
+    /// `<w:vanish/>` — Word never renders this run at all (draft notes,
+    /// comment-reference glyph scaffolding, TOC/index field-code
+    /// internals). Converters use this to exclude the run from every
+    /// extraction surface, the same way a run-level `w:del` already is.
+    pub hidden: Option<bool>,
 }
 
 /// Paragraph-level formatting properties (`w:pPr`).
@@ -43,24 +60,193 @@ pub struct ParagraphProperties {
     pub numbering_ref: Option<NumberingRef>,
     /// Outline level (0 = Heading 1, 1 = Heading 2, …).
     pub outline_level: Option<u8>,
-    /// Paragraph-mark run properties (`w:rPr` inside `w:pPr`).
-    pub run_properties: Option<RunProperties>,
+    /// Paragraph-mark run properties (`w:rPr` inside `w:pPr`). Boxed:
+    /// present on only a small minority of real paragraphs, but
+    /// `Option<T>` reserves `size_of(T)` even when `None`.
+    pub run_properties: Option<Box<RunProperties>>,
     /// Frame position from `<w:framePr>`. When present this paragraph is
     /// absolutely positioned on the page (used by layout-preserving
     /// PDF-derived DOCX, e.g. pdf_oxide's `to_docx_bytes_layout`).
     pub frame_position: Option<FrameProps>,
     /// Section properties from `<w:sectPr>` inside this paragraph's `<w:pPr>`.
     /// When present this paragraph terminates a section — the properties
-    /// describe the section that ends here.
-    pub section_properties: Option<super::SectionProperties>,
+    /// describe the section that ends here. Boxed: only the last
+    /// paragraph of each section carries this.
+    pub section_properties: Option<Box<super::SectionProperties>>,
     /// True when the paragraph has a `<w:pBdr><w:bottom .../></w:pBdr>`.
     /// Used to recover horizontal rules: pdf_to_ir emits
     /// `Element::ThematicBreak` which round-trips through DOCX as an
     /// empty paragraph with a single bottom border. Without
     /// preserving this flag the rule would be silently dropped on
     /// re-parse and turned into a plain empty paragraph.
-    #[allow(dead_code)]
     pub has_bottom_border: bool,
+    /// Full `<w:pBdr>` edge styling. `has_bottom_border` stays as the
+    /// cheap horizontal-rule probe; this carries the actual widths,
+    /// colours and styles so they survive a read. Boxed: rare on real
+    /// paragraphs.
+    pub borders: Option<Box<ParagraphBorders>>,
+    /// `<w:keepNext/>` — keep with the following paragraph. `None` when the
+    /// element is absent, so a style-inherited value is distinguishable from
+    /// an explicit `w:val="0"` that turns it off.
+    pub keep_next: Option<bool>,
+    /// `<w:keepLines/>` — keep all lines of this paragraph together.
+    pub keep_lines: Option<bool>,
+    /// `<w:pageBreakBefore/>` — force a page break before this paragraph.
+    pub page_break_before: Option<bool>,
+    /// Paragraph shading (`<w:shd>`) — background fill. Boxed: rare on
+    /// real paragraphs.
+    pub shading: Option<Box<super::table::Shading>>,
+    /// Custom tab stops from `<w:tabs>`.
+    pub tabs: Vec<TabStopDef>,
+}
+
+/// One `<w:tab>` entry inside `<w:tabs>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabStopDef {
+    /// Position in twips (`w:pos`).
+    pub position_twips: i32,
+    /// Alignment (`w:val`): left/center/right/decimal/bar.
+    pub alignment: String,
+    /// Leader character style (`w:leader`).
+    pub leader: Option<String>,
+}
+
+/// A single border edge (`<w:top>`, `<w:left>`, …) as it appears
+/// inside `<w:pBdr>`, `<w:tblBorders>` and `<w:tcBorders>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BorderEdge {
+    /// `w:val` — the line style name (`single`, `double`, `dotted`, …).
+    pub style: Option<String>,
+    /// `w:color` — `RRGGBB` or `auto`.
+    pub color: Option<String>,
+    /// `w:sz` — line width in eighths of a point.
+    pub size: Option<u32>,
+    /// `w:space` — padding between border and text, in points.
+    pub space: Option<u32>,
+}
+
+/// The five paragraph border edges (`<w:pBdr>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParagraphBorders {
+    /// Top edge.
+    pub top: Option<BorderEdge>,
+    /// Bottom edge.
+    pub bottom: Option<BorderEdge>,
+    /// Left edge.
+    pub left: Option<BorderEdge>,
+    /// Right edge.
+    pub right: Option<BorderEdge>,
+    /// Edge drawn between consecutive paragraphs sharing this border set.
+    pub between: Option<BorderEdge>,
+}
+
+/// Table / cell border edges (`<w:tblBorders>`, `<w:tcBorders>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableBorders {
+    /// Top edge.
+    pub top: Option<BorderEdge>,
+    /// Bottom edge.
+    pub bottom: Option<BorderEdge>,
+    /// Left (`w:left` / `w:start`) edge.
+    pub left: Option<BorderEdge>,
+    /// Right (`w:right` / `w:end`) edge.
+    pub right: Option<BorderEdge>,
+    /// Interior horizontal edges.
+    pub inside_h: Option<BorderEdge>,
+    /// Interior vertical edges.
+    pub inside_v: Option<BorderEdge>,
+}
+
+/// Parse one border edge element's attributes.
+pub(crate) fn parse_border_edge(e: &BytesStart) -> BorderEdge {
+    // One pass over the attributes: a bordered table has six edges per
+    // cell, and reading four keys with four rescans each was a fifth of
+    // the parse of a large table document.
+    let mut edge = BorderEdge::default();
+    for attr in xml::attrs(e) {
+        let Ok((key, value)) = attr else { break };
+        match key {
+            "w:val" => edge.style = Some(value.into_owned()),
+            "w:color" => edge.color = Some(value.into_owned()),
+            "w:sz" => edge.size = value.parse().ok(),
+            "w:space" => edge.space = value.parse().ok(),
+            _ => {},
+        }
+    }
+    edge
+}
+
+impl RunProperties {
+    /// Overlay `src` on top of `self`: every field `src` states explicitly
+    /// wins, everything else is left alone. Used to fold a style chain
+    /// (document defaults → style → parent style → direct `w:rPr`) into one
+    /// effective property set.
+    pub fn overlay(&mut self, src: &RunProperties) {
+        macro_rules! take {
+            ($($f:ident),* $(,)?) => {$(
+                if src.$f.is_some() { self.$f = src.$f.clone(); }
+            )*};
+        }
+        take!(
+            bold,
+            italic,
+            underline,
+            strike,
+            dstrike,
+            font_size,
+            font_name,
+            color,
+            highlight,
+            vertical_align,
+            style_id,
+            caps,
+            small_caps,
+            char_spacing,
+            shading_fill,
+            hidden,
+        );
+    }
+}
+
+impl ParagraphProperties {
+    /// Overlay `src` on top of `self`. See [`RunProperties::overlay`].
+    ///
+    /// `run_properties` is merged recursively rather than replaced, so a
+    /// paragraph style that sets only the font does not wipe out the bold
+    /// flag its parent style set.
+    pub fn overlay(&mut self, src: &ParagraphProperties) {
+        macro_rules! take {
+            ($($f:ident),* $(,)?) => {$(
+                if src.$f.is_some() { self.$f = src.$f.clone(); }
+            )*};
+        }
+        take!(
+            style_id,
+            justification,
+            indent,
+            spacing,
+            numbering_ref,
+            outline_level,
+            frame_position,
+            section_properties,
+            borders,
+            keep_next,
+            keep_lines,
+            page_break_before,
+            shading,
+        );
+        if !src.tabs.is_empty() {
+            self.tabs = src.tabs.clone();
+        }
+        if src.has_bottom_border {
+            self.has_bottom_border = true;
+        }
+        match (self.run_properties.as_mut(), src.run_properties.as_ref()) {
+            (Some(dst), Some(s)) => dst.overlay(s),
+            (None, Some(s)) => self.run_properties = Some(s.clone()),
+            _ => {},
+        }
+    }
 }
 
 /// `<w:framePr>` attributes — page-anchored frame coordinates in twips.
@@ -217,50 +403,50 @@ pub(crate) fn parse_run_properties(
                 if xml::matches_ns(resolve, wml) {
                     let local = e.local_name();
                     match local.as_ref() {
-                        b"b" => {
+                        "b" => {
                             props.bold = Some(parse_toggle(e));
                             xml::skip_element(reader)?;
                         },
-                        b"i" => {
+                        "i" => {
                             props.italic = Some(parse_toggle(e));
                             xml::skip_element(reader)?;
                         },
-                        b"strike" => {
+                        "strike" => {
                             props.strike = Some(parse_toggle(e));
                             xml::skip_element(reader)?;
                         },
-                        b"dstrike" => {
+                        "dstrike" => {
                             props.dstrike = Some(parse_toggle(e));
                             xml::skip_element(reader)?;
                         },
-                        b"u" => {
+                        "u" => {
                             props.underline = Some(parse_underline(e));
                             xml::skip_element(reader)?;
                         },
-                        b"sz" => {
+                        "sz" => {
                             if let Some(val) = parse_half_point_val(e)? {
                                 props.font_size = Some(val);
                             }
                             xml::skip_element(reader)?;
                         },
-                        b"rFonts" => {
-                            if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
+                        "rFonts" => {
+                            if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
                                 props.font_name = Some(ascii.into_owned());
                             }
                             xml::skip_element(reader)?;
                         },
-                        b"color" => {
+                        "color" => {
                             props.color = parse_color_ref(e)?;
                             xml::skip_element(reader)?;
                         },
-                        b"highlight" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        "highlight" => {
+                            if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                                 props.highlight = Some(val.into_owned());
                             }
                             xml::skip_element(reader)?;
                         },
-                        b"vertAlign" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        "vertAlign" => {
+                            if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                                 props.vertical_align = Some(match val.as_ref() {
                                     "superscript" => VerticalAlign::Superscript,
                                     "subscript" => VerticalAlign::Subscript,
@@ -269,10 +455,14 @@ pub(crate) fn parse_run_properties(
                             }
                             xml::skip_element(reader)?;
                         },
-                        b"rStyle" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        "rStyle" => {
+                            if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                                 props.style_id = Some(val.into_owned());
                             }
+                            xml::skip_element(reader)?;
+                        },
+                        "vanish" => {
+                            props.hidden = Some(parse_toggle(e));
                             xml::skip_element(reader)?;
                         },
                         _ => {
@@ -286,31 +476,31 @@ pub(crate) fn parse_run_properties(
             (ref resolve, Event::Empty(ref e)) if xml::matches_ns(resolve, wml) => {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"b" => props.bold = Some(parse_toggle(e)),
-                    b"i" => props.italic = Some(parse_toggle(e)),
-                    b"strike" => props.strike = Some(parse_toggle(e)),
-                    b"dstrike" => props.dstrike = Some(parse_toggle(e)),
-                    b"u" => props.underline = Some(parse_underline(e)),
-                    b"sz" => {
+                    "b" => props.bold = Some(parse_toggle(e)),
+                    "i" => props.italic = Some(parse_toggle(e)),
+                    "strike" => props.strike = Some(parse_toggle(e)),
+                    "dstrike" => props.dstrike = Some(parse_toggle(e)),
+                    "u" => props.underline = Some(parse_underline(e)),
+                    "sz" => {
                         if let Some(val) = parse_half_point_val(e)? {
                             props.font_size = Some(val);
                         }
                     },
-                    b"rFonts" => {
-                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
+                    "rFonts" => {
+                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
                             props.font_name = Some(ascii.into_owned());
                         }
                     },
-                    b"color" => {
+                    "color" => {
                         props.color = parse_color_ref(e)?;
                     },
-                    b"highlight" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "highlight" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.highlight = Some(val.into_owned());
                         }
                     },
-                    b"vertAlign" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "vertAlign" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.vertical_align = Some(match val.as_ref() {
                                 "superscript" => VerticalAlign::Superscript,
                                 "subscript" => VerticalAlign::Subscript,
@@ -318,16 +508,19 @@ pub(crate) fn parse_run_properties(
                             });
                         }
                     },
-                    b"rStyle" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "rStyle" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.style_id = Some(val.into_owned());
                         }
+                    },
+                    "vanish" => {
+                        props.hidden = Some(parse_toggle(e));
                     },
                     _ => {},
                 }
             },
             (ref resolve, Event::End(ref e))
-                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"rPr" =>
+                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == "rPr" =>
             {
                 break;
             },
@@ -353,39 +546,37 @@ pub(crate) fn parse_paragraph_properties(
                 if xml::matches_ns(resolve, wml) {
                     let local = e.local_name();
                     match local.as_ref() {
-                        b"pStyle" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        "pStyle" => {
+                            if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                                 props.style_id = Some(val.into_owned());
                             }
                             xml::skip_element(reader)?;
                         },
-                        b"jc" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        "jc" => {
+                            if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                                 props.justification = Some(parse_justification_value(&val));
                             }
                             xml::skip_element(reader)?;
                         },
-                        b"ind" => {
+                        "ind" => {
                             props.indent = Some(parse_indent(e)?);
                             xml::skip_element(reader)?;
                         },
-                        b"spacing" => {
+                        "spacing" => {
                             props.spacing = Some(parse_spacing(e)?);
                             xml::skip_element(reader)?;
                         },
-                        b"numPr" => {
+                        "numPr" => {
                             props.numbering_ref = Some(parse_num_pr(reader)?);
                         },
-                        b"outlineLvl" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                if let Ok(lvl) = val.parse::<u8>() {
-                                    props.outline_level = Some(lvl);
-                                }
+                        "outlineLvl" => {
+                            if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
+                                props.outline_level = parse_outline_level(&val);
                             }
                             xml::skip_element(reader)?;
                         },
-                        b"rPr" => {
-                            props.run_properties = Some(parse_run_properties(reader)?);
+                        "rPr" => {
+                            props.run_properties = Some(Box::new(parse_run_properties(reader)?));
                         },
                         _ => {
                             xml::skip_element(reader)?;
@@ -398,34 +589,32 @@ pub(crate) fn parse_paragraph_properties(
             (ref resolve, Event::Empty(ref e)) if xml::matches_ns(resolve, wml) => {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"pStyle" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "pStyle" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.style_id = Some(val.into_owned());
                         }
                     },
-                    b"jc" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "jc" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.justification = Some(parse_justification_value(&val));
                         }
                     },
-                    b"ind" => {
+                    "ind" => {
                         props.indent = Some(parse_indent(e)?);
                     },
-                    b"spacing" => {
+                    "spacing" => {
                         props.spacing = Some(parse_spacing(e)?);
                     },
-                    b"outlineLvl" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            if let Ok(lvl) = val.parse::<u8>() {
-                                props.outline_level = Some(lvl);
-                            }
+                    "outlineLvl" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
+                            props.outline_level = parse_outline_level(&val);
                         }
                     },
                     _ => {},
                 }
             },
             (ref resolve, Event::End(ref e))
-                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"pPr" =>
+                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == "pPr" =>
             {
                 break;
             },
@@ -451,50 +640,50 @@ pub(crate) fn parse_run_properties_fast(
             Event::Start(ref e) => {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"b" => {
+                    "b" => {
                         props.bold = Some(parse_toggle(e));
                         xml::skip_element_fast(reader)?;
                     },
-                    b"i" => {
+                    "i" => {
                         props.italic = Some(parse_toggle(e));
                         xml::skip_element_fast(reader)?;
                     },
-                    b"strike" => {
+                    "strike" => {
                         props.strike = Some(parse_toggle(e));
                         xml::skip_element_fast(reader)?;
                     },
-                    b"dstrike" => {
+                    "dstrike" => {
                         props.dstrike = Some(parse_toggle(e));
                         xml::skip_element_fast(reader)?;
                     },
-                    b"u" => {
+                    "u" => {
                         props.underline = Some(parse_underline(e));
                         xml::skip_element_fast(reader)?;
                     },
-                    b"sz" => {
+                    "sz" => {
                         if let Some(val) = parse_half_point_val(e)? {
                             props.font_size = Some(val);
                         }
                         xml::skip_element_fast(reader)?;
                     },
-                    b"rFonts" => {
-                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
+                    "rFonts" => {
+                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
                             props.font_name = Some(ascii.into_owned());
                         }
                         xml::skip_element_fast(reader)?;
                     },
-                    b"color" => {
+                    "color" => {
                         props.color = parse_color_ref(e)?;
                         xml::skip_element_fast(reader)?;
                     },
-                    b"highlight" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "highlight" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.highlight = Some(val.into_owned());
                         }
                         xml::skip_element_fast(reader)?;
                     },
-                    b"vertAlign" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "vertAlign" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.vertical_align = Some(match val.as_ref() {
                                 "superscript" => VerticalAlign::Superscript,
                                 "subscript" => VerticalAlign::Subscript,
@@ -503,10 +692,33 @@ pub(crate) fn parse_run_properties_fast(
                         }
                         xml::skip_element_fast(reader)?;
                     },
-                    b"rStyle" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "rStyle" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.style_id = Some(val.into_owned());
                         }
+                        xml::skip_element_fast(reader)?;
+                    },
+                    "caps" => {
+                        props.caps = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    "smallCaps" => {
+                        props.small_caps = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    "spacing" => {
+                        props.char_spacing = parse_signed_val(e);
+                        xml::skip_element_fast(reader)?;
+                    },
+                    "shd" => {
+                        props.shading_fill = xml::optional_attr_str(e, "w:fill")
+                            .ok()
+                            .flatten()
+                            .map(|v| v.into_owned());
+                        xml::skip_element_fast(reader)?;
+                    },
+                    "vanish" => {
+                        props.hidden = Some(parse_toggle(e));
                         xml::skip_element_fast(reader)?;
                     },
                     _ => {
@@ -517,31 +729,41 @@ pub(crate) fn parse_run_properties_fast(
             Event::Empty(ref e) => {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"b" => props.bold = Some(parse_toggle(e)),
-                    b"i" => props.italic = Some(parse_toggle(e)),
-                    b"strike" => props.strike = Some(parse_toggle(e)),
-                    b"dstrike" => props.dstrike = Some(parse_toggle(e)),
-                    b"u" => props.underline = Some(parse_underline(e)),
-                    b"sz" => {
+                    "caps" => props.caps = Some(parse_toggle(e)),
+                    "smallCaps" => props.small_caps = Some(parse_toggle(e)),
+                    "spacing" => props.char_spacing = parse_signed_val(e),
+                    "vanish" => props.hidden = Some(parse_toggle(e)),
+                    "shd" => {
+                        props.shading_fill = xml::optional_attr_str(e, "w:fill")
+                            .ok()
+                            .flatten()
+                            .map(|v| v.into_owned());
+                    },
+                    "b" => props.bold = Some(parse_toggle(e)),
+                    "i" => props.italic = Some(parse_toggle(e)),
+                    "strike" => props.strike = Some(parse_toggle(e)),
+                    "dstrike" => props.dstrike = Some(parse_toggle(e)),
+                    "u" => props.underline = Some(parse_underline(e)),
+                    "sz" => {
                         if let Some(val) = parse_half_point_val(e)? {
                             props.font_size = Some(val);
                         }
                     },
-                    b"rFonts" => {
-                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
+                    "rFonts" => {
+                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
                             props.font_name = Some(ascii.into_owned());
                         }
                     },
-                    b"color" => {
+                    "color" => {
                         props.color = parse_color_ref(e)?;
                     },
-                    b"highlight" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "highlight" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.highlight = Some(val.into_owned());
                         }
                     },
-                    b"vertAlign" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "vertAlign" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.vertical_align = Some(match val.as_ref() {
                                 "superscript" => VerticalAlign::Superscript,
                                 "subscript" => VerticalAlign::Subscript,
@@ -549,15 +771,15 @@ pub(crate) fn parse_run_properties_fast(
                             });
                         }
                     },
-                    b"rStyle" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "rStyle" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.style_id = Some(val.into_owned());
                         }
                     },
                     _ => {},
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"rPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "rPr" => {
                 break;
             },
             Event::Eof => break,
@@ -578,82 +800,75 @@ pub(crate) fn parse_paragraph_properties_fast(
             Event::Start(ref e) => {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"pStyle" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "pStyle" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.style_id = Some(val.into_owned());
                         }
                         xml::skip_element_fast(reader)?;
                     },
-                    b"jc" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "jc" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.justification = Some(parse_justification_value(&val));
                         }
                         xml::skip_element_fast(reader)?;
                     },
-                    b"ind" => {
+                    "ind" => {
                         props.indent = Some(parse_indent(e)?);
                         xml::skip_element_fast(reader)?;
                     },
-                    b"spacing" => {
+                    "spacing" => {
                         props.spacing = Some(parse_spacing(e)?);
                         xml::skip_element_fast(reader)?;
                     },
-                    b"numPr" => {
+                    "numPr" => {
                         props.numbering_ref = Some(parse_num_pr_fast(reader)?);
                     },
-                    b"outlineLvl" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            if let Ok(lvl) = val.parse::<u8>() {
-                                props.outline_level = Some(lvl);
-                            }
+                    "outlineLvl" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
+                            props.outline_level = parse_outline_level(&val);
                         }
                         xml::skip_element_fast(reader)?;
                     },
-                    b"rPr" => {
-                        props.run_properties = Some(parse_run_properties_fast(reader)?);
+                    "rPr" => {
+                        props.run_properties = Some(Box::new(parse_run_properties_fast(reader)?));
                     },
-                    b"framePr" => {
+                    "framePr" => {
                         props.frame_position = parse_frame_pr(e);
                         xml::skip_element_fast(reader)?;
                     },
-                    b"sectPr" => {
+                    "sectPr" => {
                         props.section_properties =
-                            Some(super::parse_section_properties(reader, e)?);
+                            Some(Box::new(super::parse_section_properties(reader, e)?));
                     },
-                    b"pBdr" => {
-                        // Walk the <w:pBdr> subtree to its matching
-                        // </w:pBdr>, noting whether a <w:bottom> edge
-                        // appears (empty paragraph + bottom border = the
-                        // conventional DOCX <hr/>). We don't capture full
-                        // border styling — just the presence of a bottom
-                        // edge. Border edges are self-closing (Event::Empty),
-                        // so depth only moves on non-empty Start/End; the
-                        // loop exits at the first depth-0 End, which the
-                        // balanced counter guarantees is </w:pBdr>.
-                        let mut depth = 1i32;
-                        loop {
-                            match reader.read_event()? {
-                                Event::Empty(ref ee) => {
-                                    if ee.local_name().as_ref() == b"bottom" {
-                                        props.has_bottom_border = true;
-                                    }
-                                },
-                                Event::Start(ref ee) => {
-                                    if ee.local_name().as_ref() == b"bottom" {
-                                        props.has_bottom_border = true;
-                                    }
-                                    depth += 1;
-                                },
-                                Event::End(_) => {
-                                    depth -= 1;
-                                    if depth <= 0 {
-                                        break;
-                                    }
-                                },
-                                Event::Eof => break,
-                                _ => {},
-                            }
-                        }
+                    "pBdr" => {
+                        // Capture every `<w:pBdr>` edge with its full
+                        // styling. `has_bottom_border` stays the cheap
+                        // horizontal-rule probe (empty paragraph + bottom
+                        // border = the conventional DOCX `<hr/>`), but the
+                        // widths, colours and styles now survive the read
+                        // instead of being narrowed to that one boolean.
+                        let borders = parse_paragraph_borders_fast(reader)?;
+                        props.has_bottom_border = borders.bottom.is_some();
+                        props.borders = Some(Box::new(borders));
+                    },
+                    "keepNext" => {
+                        props.keep_next = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    "keepLines" => {
+                        props.keep_lines = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    "pageBreakBefore" => {
+                        props.page_break_before = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    "shd" => {
+                        props.shading = Some(Box::new(parse_shading(e)));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    "tabs" => {
+                        props.tabs = parse_tabs_fast(reader)?;
                     },
                     _ => {
                         xml::skip_element_fast(reader)?;
@@ -663,36 +878,38 @@ pub(crate) fn parse_paragraph_properties_fast(
             Event::Empty(ref e) => {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"pStyle" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "keepNext" => props.keep_next = Some(parse_toggle(e)),
+                    "keepLines" => props.keep_lines = Some(parse_toggle(e)),
+                    "pageBreakBefore" => props.page_break_before = Some(parse_toggle(e)),
+                    "shd" => props.shading = Some(Box::new(parse_shading(e))),
+                    "pStyle" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.style_id = Some(val.into_owned());
                         }
                     },
-                    b"jc" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "jc" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             props.justification = Some(parse_justification_value(&val));
                         }
                     },
-                    b"ind" => {
+                    "ind" => {
                         props.indent = Some(parse_indent(e)?);
                     },
-                    b"spacing" => {
+                    "spacing" => {
                         props.spacing = Some(parse_spacing(e)?);
                     },
-                    b"framePr" => {
+                    "framePr" => {
                         props.frame_position = parse_frame_pr(e);
                     },
-                    b"outlineLvl" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            if let Ok(lvl) = val.parse::<u8>() {
-                                props.outline_level = Some(lvl);
-                            }
+                    "outlineLvl" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
+                            props.outline_level = parse_outline_level(&val);
                         }
                     },
                     _ => {},
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"pPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "pPr" => {
                 break;
             },
             Event::Eof => break,
@@ -700,6 +917,120 @@ pub(crate) fn parse_paragraph_properties_fast(
         }
     }
     Ok(props)
+}
+
+/// Parse a signed `w:val` integer attribute (used by `<w:spacing>` in `w:rPr`).
+fn parse_signed_val(e: &BytesStart) -> Option<i32> {
+    xml::optional_attr_str(e, "w:val")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+}
+
+/// Parse a `<w:shd>` element's attributes.
+pub(crate) fn parse_shading(e: &BytesStart) -> super::table::Shading {
+    super::table::Shading {
+        fill: xml::optional_attr_str(e, "w:fill")
+            .ok()
+            .flatten()
+            .map(|v| v.into_owned()),
+        color: xml::optional_attr_str(e, "w:color")
+            .ok()
+            .flatten()
+            .map(|v| v.into_owned()),
+        pattern: xml::optional_attr_str(e, "w:val")
+            .ok()
+            .flatten()
+            .map(|v| v.into_owned()),
+    }
+}
+
+/// Parse the children of `<w:pBdr>`. The caller has consumed the start tag.
+fn parse_paragraph_borders_fast(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<ParagraphBorders> {
+    let mut b = ParagraphBorders::default();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let edge = parse_border_edge(e);
+                match e.local_name().as_ref() {
+                    "top" => b.top = Some(edge),
+                    "bottom" => b.bottom = Some(edge),
+                    "left" | "start" => b.left = Some(edge),
+                    "right" | "end" => b.right = Some(edge),
+                    "between" => b.between = Some(edge),
+                    _ => {},
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "pBdr" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(b)
+}
+
+/// Parse the children of `<w:tblBorders>` / `<w:tcBorders>`. The caller has
+/// consumed the start tag; `end` names the closing element to stop at.
+pub(crate) fn parse_table_borders_fast(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    end: &str,
+) -> crate::core::Result<TableBorders> {
+    let mut b = TableBorders::default();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let edge = parse_border_edge(e);
+                match e.local_name().as_ref() {
+                    "top" => b.top = Some(edge),
+                    "bottom" => b.bottom = Some(edge),
+                    "left" | "start" => b.left = Some(edge),
+                    "right" | "end" => b.right = Some(edge),
+                    "insideH" => b.inside_h = Some(edge),
+                    "insideV" => b.inside_v = Some(edge),
+                    _ => {},
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == end => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(b)
+}
+
+/// Parse the children of `<w:tabs>`. The caller has consumed the start tag.
+fn parse_tabs_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<TabStopDef>> {
+    let mut tabs = Vec::new();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "tab" => {
+                let pos = xml::optional_attr_str(e, "w:pos")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<i32>().ok());
+                if let Some(position_twips) = pos {
+                    tabs.push(TabStopDef {
+                        position_twips,
+                        alignment: xml::optional_attr_str(e, "w:val")
+                            .ok()
+                            .flatten()
+                            .map(|v| v.into_owned())
+                            .unwrap_or_else(|| "left".to_string()),
+                        leader: xml::optional_attr_str(e, "w:leader")
+                            .ok()
+                            .flatten()
+                            .map(|v| v.into_owned()),
+                    });
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "tabs" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(tabs)
 }
 
 fn parse_num_pr_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<NumberingRef> {
@@ -711,20 +1042,20 @@ fn parse_num_pr_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Resu
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"numId" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "numId" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             num_id = val.parse().unwrap_or(0);
                         }
                     },
-                    b"ilvl" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "ilvl" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             ilvl = val.parse().unwrap_or(0);
                         }
                     },
                     _ => {},
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"numPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "numPr" => {
                 break;
             },
             Event::Eof => break,
@@ -734,13 +1065,34 @@ fn parse_num_pr_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Resu
     Ok(NumberingRef { num_id, ilvl })
 }
 
+/// Parse a `<w:outlineLvl w:val="N"/>` value.
+///
+/// ECMA-376 §17.3.1.20 defines the range as 0–9, where `9` "specifically
+/// indicates that there is no outline level specifically applied to this
+/// paragraph" — i.e. body text — and is also the value assumed when the
+/// element is absent. Returning `Some(9)` made every consumer treat a
+/// paragraph explicitly marked as body text as a heading: the IR converter
+/// produced an H6, and the markdown renderer emitted nine `#` characters,
+/// which no markdown reader treats as a heading at all. Word writes
+/// `w:val="9"` for "Outline level: Body Text", and the built-in
+/// `TOCHeading` style uses it to cancel the level it inherits, so any
+/// document with a generated table of contents was affected.
+///
+/// Out-of-range values are also rejected rather than passed through.
+pub(crate) fn parse_outline_level(val: &str) -> Option<u8> {
+    match val.trim().parse::<u8>() {
+        Ok(lvl) if lvl <= 8 => Some(lvl),
+        _ => None,
+    }
+}
+
 /// Parse a boolean toggle attribute. `<w:b/>` = true, `<w:b w:val="0"/>` = false.
 fn parse_toggle(e: &BytesStart) -> bool {
-    xml::parse_toggle(e, b"w:val")
+    xml::parse_toggle(e, "w:val")
 }
 
 fn parse_underline(e: &BytesStart) -> UnderlineType {
-    match xml::optional_attr_str(e, b"w:val") {
+    match xml::optional_attr_str(e, "w:val") {
         Ok(Some(ref val)) => match val.as_ref() {
             "single" => UnderlineType::Single,
             "double" => UnderlineType::Double,
@@ -782,7 +1134,7 @@ fn parse_numeric<T: std::str::FromStr>(s: &str) -> std::result::Result<T, T::Err
 }
 
 fn parse_half_point_val(e: &BytesStart) -> crate::core::Result<Option<HalfPoint>> {
-    match xml::optional_attr_str(e, b"w:val")? {
+    match xml::optional_attr_str(e, "w:val")? {
         Some(ref val) => {
             let v: u32 = parse_numeric(val)?;
             Ok(Some(HalfPoint(v)))
@@ -794,18 +1146,31 @@ fn parse_half_point_val(e: &BytesStart) -> crate::core::Result<Option<HalfPoint>
 fn parse_color_ref(e: &BytesStart) -> crate::core::Result<Option<ColorRef>> {
     use crate::core::theme::{RgbColor, ThemeColorSlot};
 
-    let val = xml::optional_attr_str(e, b"w:val")?;
-    let theme_color = xml::optional_attr_str(e, b"w:themeColor")?;
+    let val = xml::optional_attr_str(e, "w:val")?;
+    let theme_color = xml::optional_attr_str(e, "w:themeColor")?;
+
+    // The literal `w:val` doubles as the fallback for consumers that
+    // cannot resolve the theme, so parse it before branching on
+    // `w:themeColor` and carry it into the theme reference.
+    let literal = val
+        .as_deref()
+        .filter(|v| v.len() == 6)
+        .and_then(|v| RgbColor::from_hex(v).ok());
 
     if let Some(ref tc) = theme_color {
         if let Some(slot) = ThemeColorSlot::from_scheme_val(tc) {
-            let tint = xml::optional_attr_str(e, b"w:themeTint")?
+            let tint = xml::optional_attr_str(e, "w:themeTint")?
                 .and_then(|v| u8::from_str_radix(&v, 16).ok())
                 .map(|v| v as f64 / 255.0);
-            let shade = xml::optional_attr_str(e, b"w:themeShade")?
+            let shade = xml::optional_attr_str(e, "w:themeShade")?
                 .and_then(|v| u8::from_str_radix(&v, 16).ok())
                 .map(|v| v as f64 / 255.0);
-            return Ok(Some(ColorRef::Theme { slot, tint, shade }));
+            return Ok(Some(ColorRef::Theme {
+                slot,
+                tint,
+                shade,
+                fallback: literal,
+            }));
         }
     }
 
@@ -824,26 +1189,26 @@ fn parse_color_ref(e: &BytesStart) -> crate::core::Result<Option<ColorRef>> {
 
 pub(crate) fn parse_indent(e: &BytesStart) -> crate::core::Result<ParagraphIndent> {
     let mut indent = ParagraphIndent::default();
-    if let Some(val) = xml::optional_attr_str(e, b"w:left")? {
+    if let Some(val) = xml::optional_attr_str(e, "w:left")? {
         indent.left = Some(Twip(parse_numeric(&val)?));
     }
     if indent.left.is_none() {
-        if let Some(val) = xml::optional_attr_str(e, b"w:start")? {
+        if let Some(val) = xml::optional_attr_str(e, "w:start")? {
             indent.left = Some(Twip(parse_numeric(&val)?));
         }
     }
-    if let Some(val) = xml::optional_attr_str(e, b"w:right")? {
+    if let Some(val) = xml::optional_attr_str(e, "w:right")? {
         indent.right = Some(Twip(parse_numeric(&val)?));
     }
     if indent.right.is_none() {
-        if let Some(val) = xml::optional_attr_str(e, b"w:end")? {
+        if let Some(val) = xml::optional_attr_str(e, "w:end")? {
             indent.right = Some(Twip(parse_numeric(&val)?));
         }
     }
-    if let Some(val) = xml::optional_attr_str(e, b"w:firstLine")? {
+    if let Some(val) = xml::optional_attr_str(e, "w:firstLine")? {
         indent.first_line = Some(Twip(parse_numeric(&val)?));
     }
-    if let Some(val) = xml::optional_attr_str(e, b"w:hanging")? {
+    if let Some(val) = xml::optional_attr_str(e, "w:hanging")? {
         indent.hanging = Some(Twip(parse_numeric(&val)?));
     }
     Ok(indent)
@@ -854,16 +1219,16 @@ pub(crate) fn parse_indent(e: &BytesStart) -> crate::core::Result<ParagraphInden
 /// e.g. when only `wrap`/`anchor` modifiers are set without explicit
 /// position/size, which we can't reproduce as positional.
 fn parse_frame_pr(e: &BytesStart) -> Option<FrameProps> {
-    let read_int = |attr: &[u8]| -> Option<i32> {
+    let read_int = |attr: &str| -> Option<i32> {
         xml::optional_attr_str(e, attr)
             .ok()
             .flatten()
             .and_then(|v| v.parse::<i32>().ok())
     };
-    let x = read_int(b"w:x");
-    let y = read_int(b"w:y");
-    let w = read_int(b"w:w");
-    let h = read_int(b"w:h");
+    let x = read_int("w:x");
+    let y = read_int("w:y");
+    let w = read_int("w:w");
+    let h = read_int("w:h");
     match (x, y, w, h) {
         (Some(x), Some(y), Some(w), Some(h)) => Some(FrameProps {
             x_twips: x,
@@ -877,15 +1242,15 @@ fn parse_frame_pr(e: &BytesStart) -> Option<FrameProps> {
 
 fn parse_spacing(e: &BytesStart) -> crate::core::Result<ParagraphSpacing> {
     let mut spacing = ParagraphSpacing::default();
-    if let Some(val) = xml::optional_attr_str(e, b"w:before")? {
+    if let Some(val) = xml::optional_attr_str(e, "w:before")? {
         spacing.before = Some(Twip(parse_numeric(&val)?));
     }
-    if let Some(val) = xml::optional_attr_str(e, b"w:after")? {
+    if let Some(val) = xml::optional_attr_str(e, "w:after")? {
         spacing.after = Some(Twip(parse_numeric(&val)?));
     }
-    if let Some(val) = xml::optional_attr_str(e, b"w:line")? {
+    if let Some(val) = xml::optional_attr_str(e, "w:line")? {
         let line_val: i32 = parse_numeric(&val)?;
-        let rule = xml::optional_attr_str(e, b"w:lineRule")?.map(|r| match r.as_ref() {
+        let rule = xml::optional_attr_str(e, "w:lineRule")?.map(|r| match r.as_ref() {
             "auto" => LineSpacingRule::Auto,
             "exact" => LineSpacingRule::Exact,
             "atLeast" => LineSpacingRule::AtLeast,
@@ -912,13 +1277,13 @@ fn parse_num_pr(reader: &mut quick_xml::NsReader<&[u8]>) -> crate::core::Result<
             {
                 let local = e.local_name();
                 match local.as_ref() {
-                    b"numId" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "numId" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             num_id = val.parse().unwrap_or(0);
                         }
                     },
-                    b"ilvl" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "ilvl" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             ilvl = val.parse().unwrap_or(0);
                         }
                     },
@@ -926,7 +1291,7 @@ fn parse_num_pr(reader: &mut quick_xml::NsReader<&[u8]>) -> crate::core::Result<
                 }
             },
             (ref resolve, Event::End(ref e))
-                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"numPr" =>
+                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == "numPr" =>
             {
                 break;
             },
@@ -941,8 +1306,33 @@ fn parse_num_pr(reader: &mut quick_xml::NsReader<&[u8]>) -> crate::core::Result<
 mod tests {
     use super::*;
 
+    /// Regression: `ParagraphProperties`'s rarely-populated
+    /// sub-structs must stay boxed, not silently regress back to
+    /// `Option<T>` (which reserves `size_of(T)` even when `None`).
+    /// `Paragraph` (paragraph.rs) was 896 bytes before this fix, dominated
+    /// by an unboxed `ParagraphProperties` at 872 bytes; both are checked
+    /// here with headroom above the measured post-fix sizes (176B /
+    /// 200B) so an unrelated new field doesn't make this test flaky, but
+    /// a *large struct un-boxed back into `Option<T>`* — the actual
+    /// regression this guards against — still trips it.
     #[test]
-    fn parse_toggle_bare() {
+    fn test_paragraph_properties_size_stays_boxed() {
+        assert!(
+            std::mem::size_of::<ParagraphProperties>() <= 250,
+            "ParagraphProperties grew to {} bytes — check borders/run_properties/\
+             section_properties/shading are still Option<Box<T>>, not Option<T>",
+            std::mem::size_of::<ParagraphProperties>()
+        );
+        assert!(
+            std::mem::size_of::<super::super::paragraph::Paragraph>() <= 300,
+            "Paragraph grew to {} bytes — a ParagraphProperties field regression \
+             would show up here too",
+            std::mem::size_of::<super::super::paragraph::Paragraph>()
+        );
+    }
+
+    #[test]
+    fn test_parse_toggle_bare() {
         let xml =
             br#"<w:b xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
@@ -959,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_toggle_false() {
+    fn test_parse_toggle_false() {
         let xml = br#"<w:b w:val="0" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
         loop {
@@ -975,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_run_props_bold_italic() {
+    fn test_parse_run_props_bold_italic() {
         let xml =
             br#"<w:rPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:b/>
@@ -996,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_paragraph_props_style_justification() {
+    fn test_parse_paragraph_props_style_justification() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:pStyle w:val="Heading1"/>
@@ -1016,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_indent_values() {
+    fn test_parse_indent_values() {
         let xml = br#"<w:ind w:left="720" w:hanging="360" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
         loop {
@@ -1041,7 +1431,7 @@ mod tests {
         let mut reader = xml::make_fast_reader(xml);
         loop {
             match reader.read_event().unwrap() {
-                Event::Start(ref e) if e.local_name().as_ref() == b"pPr" => return reader,
+                Event::Start(ref e) if e.local_name().as_ref() == "pPr" => return reader,
                 Event::Eof => panic!("no <w:pPr> in test xml"),
                 _ => {},
             }
@@ -1051,7 +1441,7 @@ mod tests {
     // ── framePr ─────────────────────────────────────────────────────────
 
     #[test]
-    fn parse_frame_pr_empty_element() {
+    fn test_parse_frame_pr_empty_element() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:framePr w:x="720" w:y="1080" w:w="3000" w:h="500"/>
@@ -1066,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_frame_pr_missing_attrs_returns_none() {
+    fn test_parse_frame_pr_missing_attrs_returns_none() {
         // Missing w:h → frame_position must be None.
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -1078,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_frame_pr_inside_start_form() {
+    fn test_parse_frame_pr_inside_start_form() {
         // Start/End form (rather than Empty) — should still parse.
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -1094,7 +1484,7 @@ mod tests {
     // ── pBdr / has_bottom_border ────────────────────────────────────────
 
     #[test]
-    fn parse_p_bdr_with_bottom() {
+    fn test_parse_p_bdr_with_bottom() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:pBdr>
@@ -1107,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_p_bdr_without_bottom() {
+    fn test_parse_p_bdr_without_bottom() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:pBdr>
@@ -1121,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn paragraph_properties_default_has_no_frame_or_border() {
+    fn test_paragraph_properties_default_has_no_frame_or_border() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:pStyle w:val="Normal"/>

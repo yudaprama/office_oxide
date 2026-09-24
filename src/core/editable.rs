@@ -162,15 +162,22 @@ impl EditablePackage {
         let mut zip = ZipWriter::new(writer);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-        // Write all parts
-        for (name, data) in &self.parts {
+        // Sorted: parts and part_rels are HashMaps, so iterating them directly
+        // produced a different ZIP entry order on every save. Saving an
+        // unchanged document then produced a different byte stream each time,
+        // defeating content-hash caching and churning any VCS around the CLI.
+        let mut parts: Vec<_> = self.parts.iter().collect();
+        parts.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        for (name, data) in parts {
             let zip_path = &name.as_str()[1..]; // strip leading /
             zip.start_file(zip_path, options)?;
             zip.write_all(data)?;
         }
 
         // Write part-level .rels files
-        for (source, rels) in &self.part_rels {
+        let mut part_rels: Vec<_> = self.part_rels.iter().collect();
+        part_rels.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        for (source, rels) in part_rels {
             if rels.all().is_empty() {
                 continue;
             }
@@ -202,7 +209,11 @@ impl EditablePackage {
             for (ext, ct) in self.content_types.defaults() {
                 ct_builder.add_default(ext, ct);
             }
-            for (pn, ct) in self.content_types.overrides() {
+            // Sorted for the same reason as the parts above: a HashMap made
+            // [Content_Types].xml differ byte-for-byte between saves.
+            let mut overrides: Vec<_> = self.content_types.overrides().iter().collect();
+            overrides.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+            for (pn, ct) in overrides {
                 ct_builder.add_override(pn.clone(), ct);
             }
             let data = ct_builder.serialize();
@@ -220,4 +231,125 @@ fn parse_rid(id: &str) -> u32 {
     id.strip_prefix("rId")
         .and_then(|n| n.parse::<u32>().ok())
         .unwrap_or(0)
+}
+/// Replace text inside every `<{tag}>…</{tag}>` element of an OOXML part.
+///
+/// `tag` is the fully-prefixed element name (`w:t`, `a:t`). Returns the
+/// rewritten XML and the number of substitutions.
+///
+/// Two properties this must have, and previously did not:
+///
+/// * The bytes between the tags are **escaped** XML, so both the search and
+///   the substitution happen on the decoded text and the result is
+///   re-escaped. Matching the raw bytes meant `find` never matched text
+///   containing `&`, `<` or `>` — the document holds `AT&amp;T`, not
+///   `AT&T` — and a replacement containing any of them injected raw markup
+///   and produced a file the Office applications refuse to open.
+/// * The opening-tag search must match the element, not a prefix of it. A
+///   bare `find("<w:t")` also matches `<w:tbl>`, `<w:tab/>`, `<w:tc>` and
+///   `<w:trPr>`; `<a:t` likewise matches `<a:tbl>` and `<a:tc>`. Each of
+///   those would then have its "text content" rewritten and its structure
+///   mangled.
+pub fn replace_in_text_elements(
+    xml: &str,
+    tag: &str,
+    find: &str,
+    replace: &str,
+) -> (String, usize) {
+    let open_prefix = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut result = String::with_capacity(xml.len());
+    let mut count = 0usize;
+    let mut pos = 0usize;
+
+    while pos < xml.len() {
+        let Some(tag_start) = find_open_tag(xml, pos, &open_prefix) else {
+            result.push_str(&xml[pos..]);
+            break;
+        };
+        let Some(tag_end_offset) = xml[tag_start..].find('>') else {
+            result.push_str(&xml[pos..]);
+            break;
+        };
+        let tag_end = tag_start + tag_end_offset + 1;
+
+        if xml[tag_start..tag_end].ends_with("/>") {
+            result.push_str(&xml[pos..tag_end]);
+            pos = tag_end;
+            continue;
+        }
+
+        let Some(close_offset) = xml[tag_end..].find(&close) else {
+            result.push_str(&xml[pos..]);
+            break;
+        };
+        let close_start = tag_end + close_offset;
+
+        let raw = &xml[tag_end..close_start];
+        let decoded = quick_xml::escape::unescape(raw)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| raw.to_string());
+        let hits = decoded.matches(find).count();
+        result.push_str(&xml[pos..tag_end]);
+        if hits == 0 {
+            // Nothing changed — keep the source bytes byte-for-byte rather
+            // than round-tripping them through the escaper.
+            result.push_str(raw);
+        } else {
+            count += hits;
+            result.push_str(&quick_xml::escape::escape(decoded.replace(find, replace)));
+        }
+        pos = close_start;
+    }
+
+    (result, count)
+}
+
+/// Find the next occurrence of `prefix` that is a complete element name —
+/// i.e. followed by `>`, `/` or whitespace.
+fn find_open_tag(xml: &str, from: usize, prefix: &str) -> Option<usize> {
+    let mut pos = from;
+    while let Some(off) = xml[pos..].find(prefix) {
+        let at = pos + off;
+        match xml[at + prefix.len()..].chars().next() {
+            Some('>') | Some('/') | Some(' ') | Some('\t') | Some('\n') | Some('\r') => {
+                return Some(at);
+            },
+            _ => pos = at + prefix.len(),
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod determinism_tests {
+    use super::*;
+
+    /// Saving an unchanged package produced a different byte stream every
+    /// time, because parts, part rels and content-type overrides were all
+    /// iterated out of `HashMap`s.
+    #[test]
+    fn test_saving_the_same_package_twice_produces_the_same_bytes() {
+        let mut wb = crate::xlsx::write::XlsxWriter::new();
+        for n in ["Alpha", "Beta", "Gamma", "Delta"] {
+            wb.add_sheet(n)
+                .add_row(vec![crate::xlsx::write::CellData::String(n.into())]);
+        }
+        let mut src = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut src).unwrap();
+
+        let save = || {
+            let mut r = src.clone();
+            r.set_position(0);
+            let pkg = EditablePackage::from_reader(r).expect("open");
+            let mut out = std::io::Cursor::new(Vec::new());
+            pkg.write_to(&mut out).unwrap();
+            out.into_inner()
+        };
+
+        let first = save();
+        for _ in 0..15 {
+            assert_eq!(first, save(), "the edit path is not byte-deterministic");
+        }
+    }
 }

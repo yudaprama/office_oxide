@@ -206,6 +206,7 @@ fn normalize_path(path: &str) -> String {
 /// Reader for OPC (Open Packaging Conventions) packages (ZIP-based).
 pub struct OpcReader<R: Read + Seek> {
     archive: ZipArchive<R>,
+    entries: ZipEntryIndex,
     content_types: ContentTypes,
     package_rels: Relationships,
 }
@@ -235,15 +236,16 @@ impl OpcReader<std::io::Cursor<memmap2::Mmap>> {
 impl<R: Read + Seek> OpcReader<R> {
     /// Create an OPC reader from any `Read + Seek` source.
     pub fn new(reader: R) -> Result<Self> {
-        let mut archive = ZipArchive::new(reader)?;
+        let mut archive = open_zip_rejecting_duplicates(reader)?;
         debug!("OPC package opened, {} entries", archive.len());
+        let entries = ZipEntryIndex::new(&archive);
 
         // Eagerly parse [Content_Types].xml
-        let ct_data = read_zip_entry(&mut archive, "[Content_Types].xml")?;
+        let ct_data = read_zip_entry(&mut archive, &entries, "[Content_Types].xml")?;
         let content_types = ContentTypes::parse(&ct_data)?;
 
         // Eagerly parse _rels/.rels
-        let rels_data = read_zip_entry(&mut archive, "_rels/.rels").unwrap_or_default();
+        let rels_data = read_zip_entry(&mut archive, &entries, "_rels/.rels").unwrap_or_default();
         let package_rels = if rels_data.is_empty() {
             Relationships::empty()
         } else {
@@ -252,6 +254,7 @@ impl<R: Read + Seek> OpcReader<R> {
 
         Ok(Self {
             archive,
+            entries,
             content_types,
             package_rels,
         })
@@ -260,6 +263,32 @@ impl<R: Read + Seek> OpcReader<R> {
     /// Return the parsed `[Content_Types].xml` table.
     pub fn content_types(&self) -> &ContentTypes {
         &self.content_types
+    }
+
+    /// Fail unless the package's primary part carries one of `expected`
+    /// content types.
+    ///
+    /// Opening an XLSX as a DOCX used to succeed and produce an empty
+    /// document — a caller who guessed the format wrong got silence rather
+    /// than "this is not a WordprocessingML package". The corpus has 16
+    /// files of exactly this shape (ODT stored as `.docx`, XLSB stored as
+    /// `.xls`, and so on).
+    pub fn verify_main_content_type(&self, expected: &[&str], label: &str) -> Result<()> {
+        let Ok(main) = self.main_document_part() else {
+            // No primary part at all is a different (already reported) error.
+            return Ok(());
+        };
+        let Some(found) = self.content_types.overrides().get(&main) else {
+            // No override entry — nothing to contradict.
+            return Ok(());
+        };
+        if expected.iter().any(|e| found == e) {
+            return Ok(());
+        }
+        Err(Error::FormatMismatch {
+            found: found.clone(),
+            expected: label.to_string(),
+        })
     }
 
     /// Return the package-level relationships from `_rels/.rels`.
@@ -271,7 +300,7 @@ impl<R: Read + Seek> OpcReader<R> {
     /// XML parts with non-UTF-8 encoding declarations are automatically transcoded to UTF-8.
     pub fn read_part(&mut self, name: &PartName) -> Result<Vec<u8>> {
         let zip_path = &name.as_str()[1..]; // strip leading /
-        let data = read_zip_entry(&mut self.archive, zip_path)?;
+        let data = read_zip_entry(&mut self.archive, &self.entries, zip_path)?;
         trace!("read_part '{}' ({} bytes)", name, data.len());
 
         // Transcode non-UTF-8 XML to UTF-8 (handles ISO-8859-1, Windows-1252, etc.)
@@ -288,7 +317,7 @@ impl<R: Read + Seek> OpcReader<R> {
     pub fn read_rels_for(&mut self, part: &PartName) -> Result<Relationships> {
         let rels_zip_path = part.rels_path();
         let zip_path = &rels_zip_path[1..]; // strip leading /
-        match read_zip_entry(&mut self.archive, zip_path) {
+        match read_zip_entry(&mut self.archive, &self.entries, zip_path) {
             Ok(data) => {
                 trace!("read_rels_for '{}' ({} bytes)", part, data.len());
                 Relationships::parse(&data)
@@ -366,46 +395,175 @@ impl<R: Read + Seek> OpcReader<R> {
     /// Check if a part exists in the package.
     pub fn has_part(&self, name: &PartName) -> bool {
         let zip_path = &name.as_str()[1..];
-        self.archive.file_names().any(|n| {
-            let normalized = n.replace('\\', "/");
-            normalized.eq_ignore_ascii_case(zip_path)
-        })
+        self.archive.index_for_name(zip_path).is_some() || self.entries.lookup(zip_path).is_some()
+    }
+}
+
+/// Case-folded, separator-normalised entry name → index, built once per
+/// archive.
+///
+/// The exact-name lookup is the zip crate's own hash map, but a name that
+/// misses it — a `[Content_Types].xml` in another case, a Windows-written
+/// `_rels\.rels`, or simply an optional part that is not there — used to be
+/// resolved by scanning every entry and allocating a normalised copy of its
+/// name. Part lookups happen once per slide, sheet, header, image and
+/// relationship, and the XLSX loader *probes* for optional parts per sheet,
+/// so package open was quadratic in the number of parts: 8,000 one-cell
+/// sheets took 56 s. This index makes the miss as cheap as the hit.
+pub(crate) struct ZipEntryIndex {
+    by_normalized: HashMap<String, usize>,
+}
+
+impl ZipEntryIndex {
+    pub(crate) fn new<R: Read + Seek>(archive: &ZipArchive<R>) -> Self {
+        let mut by_normalized = HashMap::with_capacity(archive.len());
+        for name in archive.file_names() {
+            let Some(index) = archive.index_for_name(name) else {
+                continue;
+            };
+            // Two names that normalise to the same key keep the lower
+            // index, which is what the scan they replace returned.
+            by_normalized
+                .entry(Self::normalize(name))
+                .and_modify(|existing: &mut usize| *existing = (*existing).min(index))
+                .or_insert(index);
+        }
+        Self { by_normalized }
+    }
+
+    /// Index of the entry matching `name` case-insensitively, with `\` and
+    /// `/` treated alike.
+    pub(crate) fn lookup(&self, name: &str) -> Option<usize> {
+        self.by_normalized.get(&Self::normalize(name)).copied()
+    }
+
+    fn normalize(name: &str) -> String {
+        let mut key = String::with_capacity(name.len());
+        for b in name.chars() {
+            key.push(if b == '\\' {
+                '/'
+            } else {
+                b.to_ascii_lowercase()
+            });
+        }
+        key
     }
 }
 
 /// Read a ZIP entry by name, returning its bytes.
 /// Falls back to case-insensitive and backslash-normalized lookup if exact match fails.
+/// Read the "total number of entries in the central directory" field from a
+/// ZIP's End of Central Directory record.
+///
+/// Returns `None` when the record cannot be located or the archive uses the
+/// ZIP64 sentinel, in which case the caller simply skips the duplicate check
+/// rather than guessing. The field is the only way to see duplicates at all:
+/// the zip crate keys its entries by name, so two records with the same name
+/// collapse into one before any caller can notice.
+fn central_directory_entry_count<R: Read + Seek>(reader: &mut R) -> Result<Option<usize>> {
+    const EOCD_SIG: [u8; 4] = [b'P', b'K', 5, 6];
+    // The EOCD is at most 22 bytes plus a 64 KiB comment.
+    const MAX_SCAN: u64 = 22 + 0xFFFF;
+
+    let len = reader.seek(std::io::SeekFrom::End(0))?;
+    if len < 22 {
+        return Ok(None);
+    }
+    let scan = MAX_SCAN.min(len);
+    reader.seek(std::io::SeekFrom::End(-(scan as i64)))?;
+    let mut buf = vec![0u8; scan as usize];
+    reader.read_exact(&mut buf)?;
+
+    // Scan backwards for the signature; the last match is the real EOCD.
+    let Some(pos) = buf
+        .windows(4)
+        .rposition(|w| w == EOCD_SIG)
+        .filter(|&p| p + 12 <= buf.len())
+    else {
+        return Ok(None);
+    };
+    let total = u16::from_le_bytes([buf[pos + 10], buf[pos + 11]]);
+    // 0xFFFF is the ZIP64 sentinel: the real count lives elsewhere.
+    if total == u16::MAX {
+        return Ok(None);
+    }
+    Ok(Some(total as usize))
+}
+
+/// Open a ZIP archive, refusing one that holds two entries with the same
+/// name.
+///
+/// Which of two same-named entries a reader returns is unspecified, so two
+/// implementations reading the same bytes can see two different
+/// documents. That is the shape of CVE-2025-31672 and of every "scanner
+/// reads one copy, renderer reads the other" bypass. Whichever copy we
+/// picked would be accidental, so the package is refused. The
+/// central-directory record count is read *before* the zip crate sees the
+/// reader, because the crate keys entries by name and collapses duplicates
+/// before any caller can notice.
+///
+/// Every OOXML reader must open its archive through this — `OpcReader`
+/// does, and so does the XLSX fast path, which bypasses `OpcReader` for
+/// speed and for a while bypassed this check with it.
+pub(crate) fn open_zip_rejecting_duplicates<R: Read + Seek>(
+    mut reader: R,
+) -> Result<ZipArchive<R>> {
+    let declared_entries = central_directory_entry_count(&mut reader)?;
+    reader.seek(std::io::SeekFrom::Start(0))?;
+    let archive = ZipArchive::new(reader)?;
+    if let Some(declared) = declared_entries {
+        if declared > archive.len() {
+            return Err(Error::DuplicatePart(format!(
+                "{declared} central-directory entries collapse to {} unique names",
+                archive.len()
+            )));
+        }
+    }
+    Ok(archive)
+}
+
+/// Maximum uncompressed size accepted for a single OPC part.
+///
+/// Real documents do not have half-gigabyte parts; a file that claims to
+/// is either corrupt or a decompression bomb. Refusing it with an error is
+/// the difference between a failed parse and an out-of-memory kill of the
+/// host process — and every binding (Python, Go, C#, WASM) inherits that
+/// difference.
+pub const MAX_PART_SIZE: u64 = 512 * 1024 * 1024;
+
 pub(crate) fn read_zip_entry<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
+    entries: &ZipEntryIndex,
     name: &str,
 ) -> Result<Vec<u8>> {
-    // Try exact match first
-    let index = match archive.index_for_name(name) {
-        Some(i) => i,
-        None => {
-            // Fall back to fuzzy match: case-insensitive + backslash normalization.
-            // Handles [Content_Types].xml case variants and Windows-created ZIPs
-            // that use backslash separators (e.g., `_rels\.rels`).
-            let normalized = name.replace('\\', "/");
-            let mut found = None;
-            for i in 0..archive.len() {
-                if let Ok(entry) = archive.by_index_raw(i) {
-                    let entry_name = entry.name().replace('\\', "/");
-                    if entry_name.eq_ignore_ascii_case(&normalized) {
-                        found = Some(i);
-                        break;
-                    }
-                }
-            }
-            found.ok_or_else(|| Error::MissingPart(name.to_string()))?
-        },
-    };
+    // Exact match first, then the case-insensitive + backslash-normalised
+    // index: `[Content_Types].xml` case variants and Windows-created ZIPs
+    // that use backslash separators (e.g., `_rels\.rels`).
+    let index = archive
+        .index_for_name(name)
+        .or_else(|| entries.lookup(name))
+        .ok_or_else(|| Error::MissingPart(name.to_string()))?;
     let mut file = archive
         .by_index(index)
         .map_err(|_| Error::MissingPart(name.to_string()))?;
-    let mut buf = Vec::with_capacity(file.size() as usize);
-    match file.read_to_end(&mut buf) {
-        Ok(_) => Ok(buf),
+
+    // Reject decompression bombs before allocating for them. A ZIP entry
+    // declares its uncompressed size in the central directory; a 2 MB
+    // `.docx` whose `document.xml` claims to expand to 2 GiB is a
+    // deliberate memory-exhaustion payload (the OOXML analogue of
+    // CVE-2014-3574). The declared size is attacker-controlled, so it is
+    // used only to refuse early — the read below is separately capped so a
+    // lying header cannot get past it either.
+    if file.size() > MAX_PART_SIZE {
+        return Err(Error::DecompressionLimit {
+            part: name.to_string(),
+            limit: MAX_PART_SIZE,
+        });
+    }
+    let mut buf = Vec::with_capacity((file.size() as usize).min(1 << 20));
+    let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
+    match capped.read_to_end(&mut buf) {
+        Ok(_) => {},
         Err(e)
             if e.kind() == std::io::ErrorKind::InvalidData
                 && e.to_string().contains("checksum")
@@ -415,10 +573,16 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
             // doesn't match. Accept the data anyway for tolerance of real-world
             // files with minor corruption (e.g., re-saved without recomputing CRC).
             trace!("read_zip_entry '{}': ignoring CRC mismatch", name);
-            Ok(buf)
         },
-        Err(e) => Err(e.into()),
+        Err(e) => return Err(e.into()),
     }
+    if buf.len() as u64 > MAX_PART_SIZE {
+        return Err(Error::DecompressionLimit {
+            part: name.to_string(),
+            limit: MAX_PART_SIZE,
+        });
+    }
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -576,8 +740,85 @@ impl<W: Write + Seek> OpcWriter<W> {
 mod tests {
     use super::*;
 
+    fn archive_of(names: &[&str]) -> ZipArchive<std::io::Cursor<Vec<u8>>> {
+        use std::io::Write;
+        let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for name in names {
+            zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"x").unwrap();
+        }
+        ZipArchive::new(zip.finish().unwrap()).unwrap()
+    }
+
+    /// The index answers exactly what the per-call scan it replaced
+    /// answered: case-insensitive, `\` and `/` alike, absent is `None`,
+    /// and when two names collide the lower index wins as the scan did.
     #[test]
-    fn valid_part_names() {
+    fn test_entry_index_matches_case_and_separator_insensitively() {
+        let archive = archive_of(&[
+            "[Content_Types].xml",
+            "_rels\\.rels",
+            "xl/Worksheets/Sheet1.xml",
+        ]);
+        let index = ZipEntryIndex::new(&archive);
+        assert_eq!(
+            index.lookup("[content_types].XML"),
+            archive.index_for_name("[Content_Types].xml")
+        );
+        assert_eq!(index.lookup("_rels/.rels"), archive.index_for_name("_rels\\.rels"));
+        assert_eq!(
+            index.lookup("xl\\worksheets\\sheet1.xml"),
+            archive.index_for_name("xl/Worksheets/Sheet1.xml")
+        );
+        assert_eq!(index.lookup("xl/worksheets/sheet2.xml"), None);
+    }
+
+    #[test]
+    fn test_entry_index_keeps_the_first_of_two_colliding_names() {
+        let archive = archive_of(&["word/Document.xml", "word/document.xml"]);
+        let index = ZipEntryIndex::new(&archive);
+        assert_eq!(index.lookup("WORD/DOCUMENT.XML"), Some(0));
+    }
+
+    /// `has_part` and the `read_zip_entry` fallback rescanned every entry,
+    /// allocating a normalised copy of each name, on every call. Probing
+    /// each of N absent parts against N entries is the shape every loader
+    /// has (one optional rels/drawing/comments part per sheet or slide);
+    /// it must stay linear.
+    #[test]
+    fn test_absent_part_probes_do_not_rescan_the_archive() {
+        let names: Vec<String> = (0..4000)
+            .map(|i| format!("xl/worksheets/sheet{i}.xml"))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let archive = archive_of(&refs);
+        let entries = ZipEntryIndex::new(&archive);
+        let started = std::time::Instant::now();
+        let mut hits = 0;
+        for i in 0..4000 {
+            if entries
+                .lookup(&format!("xl/worksheets/_rels/sheet{i}.xml.rels"))
+                .is_some()
+            {
+                hits += 1;
+            }
+            if entries
+                .lookup(&format!("XL/WORKSHEETS/SHEET{i}.XML"))
+                .is_some()
+            {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 4000);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "8,000 lookups against 4,000 entries took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_valid_part_names() {
         assert!(PartName::new("/word/document.xml").is_ok());
         assert!(PartName::new("/xl/worksheets/sheet1.xml").is_ok());
         assert!(PartName::new("/docProps/core.xml").is_ok());
@@ -585,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_part_names() {
+    fn test_invalid_part_names() {
         assert!(PartName::new("word/document.xml").is_err()); // no leading /
         assert!(PartName::new("/word/document.xml/").is_err()); // trailing /
         assert!(PartName::new("/word//document.xml").is_err()); // empty segment
@@ -598,14 +839,14 @@ mod tests {
     }
 
     #[test]
-    fn part_name_case_insensitive_eq() {
+    fn test_part_name_case_insensitive_eq() {
         let a = PartName::new("/Word/Document.xml").unwrap();
         let b = PartName::new("/word/document.xml").unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
-    fn part_name_case_insensitive_hash() {
+    fn test_part_name_case_insensitive_hash() {
         use std::collections::HashSet;
         let mut set = HashSet::new();
         set.insert(PartName::new("/Word/Document.xml").unwrap());
@@ -613,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn part_name_components() {
+    fn test_part_name_components() {
         let pn = PartName::new("/word/document.xml").unwrap();
         assert_eq!(pn.directory(), "/word/");
         assert_eq!(pn.filename(), "document.xml");
@@ -622,28 +863,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_relative_simple() {
+    fn test_resolve_relative_simple() {
         let source = PartName::new("/word/document.xml").unwrap();
         let resolved = source.resolve_relative("media/image1.png").unwrap();
         assert_eq!(resolved.as_str(), "/word/media/image1.png");
     }
 
     #[test]
-    fn resolve_relative_parent() {
+    fn test_resolve_relative_parent() {
         let source = PartName::new("/word/document.xml").unwrap();
         let resolved = source.resolve_relative("../docProps/core.xml").unwrap();
         assert_eq!(resolved.as_str(), "/docProps/core.xml");
     }
 
     #[test]
-    fn resolve_relative_absolute() {
+    fn test_resolve_relative_absolute() {
         let source = PartName::new("/word/document.xml").unwrap();
         let resolved = source.resolve_relative("/xl/workbook.xml").unwrap();
         assert_eq!(resolved.as_str(), "/xl/workbook.xml");
     }
 
     #[test]
-    fn opc_round_trip() {
+    fn test_opc_round_trip() {
         use std::io::Cursor;
 
         let buf = Vec::new();

@@ -54,20 +54,20 @@ impl ThemeColorSlot {
         }
     }
 
-    fn from_element_name(name: &[u8]) -> Option<Self> {
+    fn from_element_name(name: &str) -> Option<Self> {
         match name {
-            b"dk1" => Some(Self::Dk1),
-            b"lt1" => Some(Self::Lt1),
-            b"dk2" => Some(Self::Dk2),
-            b"lt2" => Some(Self::Lt2),
-            b"accent1" => Some(Self::Accent1),
-            b"accent2" => Some(Self::Accent2),
-            b"accent3" => Some(Self::Accent3),
-            b"accent4" => Some(Self::Accent4),
-            b"accent5" => Some(Self::Accent5),
-            b"accent6" => Some(Self::Accent6),
-            b"hlink" => Some(Self::Hlink),
-            b"folHlink" => Some(Self::FolHlink),
+            "dk1" => Some(Self::Dk1),
+            "lt1" => Some(Self::Lt1),
+            "dk2" => Some(Self::Dk2),
+            "lt2" => Some(Self::Lt2),
+            "accent1" => Some(Self::Accent1),
+            "accent2" => Some(Self::Accent2),
+            "accent3" => Some(Self::Accent3),
+            "accent4" => Some(Self::Accent4),
+            "accent5" => Some(Self::Accent5),
+            "accent6" => Some(Self::Accent6),
+            "hlink" => Some(Self::Hlink),
+            "folHlink" => Some(Self::FolHlink),
             _ => None,
         }
     }
@@ -170,15 +170,15 @@ impl Theme {
                     let local_bytes = local.as_ref();
 
                     match local_bytes {
-                        b"theme" => {
-                            if let Ok(Some(name)) = xml::optional_attr_str(e, b"name") {
+                        "theme" => {
+                            if let Ok(Some(name)) = xml::optional_attr_str(e, "name") {
                                 theme_name = name.into_owned();
                             }
                         },
-                        b"clrScheme" => {
+                        "clrScheme" => {
                             color_scheme = Some(parse_color_scheme(&mut reader, e)?);
                         },
-                        b"fontScheme" => {
+                        "fontScheme" => {
                             font_scheme = Some(parse_font_scheme(&mut reader, e)?);
                         },
                         _ => {},
@@ -212,7 +212,7 @@ fn parse_color_scheme(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> Result<ColorScheme> {
-    let name = xml::optional_attr_str(start, b"name")?
+    let name = xml::optional_attr_str(start, "name")?
         .map(|c| c.into_owned())
         .unwrap_or_default();
     let mut colors = HashMap::new();
@@ -227,20 +227,20 @@ fn parse_color_scheme(
                 // Check if this is a color slot element (dk1, lt1, accent1, etc.)
                 if let Some(slot) = ThemeColorSlot::from_element_name(local_bytes) {
                     current_slot = Some(slot);
-                } else if local_bytes == b"srgbClr" {
+                } else if local_bytes == "srgbClr" {
                     // <a:srgbClr val="4472C4"/>
                     if let Some(slot) = current_slot {
-                        if let Ok(val) = xml::required_attr_str(e, b"val") {
+                        if let Ok(val) = xml::required_attr_str(e, "val") {
                             if let Ok(rgb) = RgbColor::from_hex(&val) {
                                 colors.insert(slot, rgb);
                             }
                         }
                     }
-                } else if local_bytes == b"sysClr" {
+                } else if local_bytes == "sysClr" {
                     // <a:sysClr val="windowText" lastClr="000000"/>
                     if let Some(slot) = current_slot {
                         // Use lastClr for the actual color value
-                        if let Ok(Some(last_clr)) = xml::optional_attr_str(e, b"lastClr") {
+                        if let Ok(Some(last_clr)) = xml::optional_attr_str(e, "lastClr") {
                             if let Ok(rgb) = RgbColor::from_hex(&last_clr) {
                                 colors.insert(slot, rgb);
                             }
@@ -252,7 +252,7 @@ fn parse_color_scheme(
                 let local = e.local_name();
                 let local_bytes = local.as_ref();
 
-                if local_bytes == b"clrScheme" {
+                if local_bytes == "clrScheme" {
                     break;
                 }
                 // Reset current_slot when we leave a color slot element
@@ -273,7 +273,7 @@ fn parse_font_scheme(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> Result<FontScheme> {
-    let name = xml::optional_attr_str(start, b"name")?
+    let name = xml::optional_attr_str(start, "name")?
         .map(|c| c.into_owned())
         .unwrap_or_default();
 
@@ -298,10 +298,10 @@ fn parse_font_scheme(
                 let local_bytes = local.as_ref();
 
                 match local_bytes {
-                    b"majorFont" => ctx = FontCtx::Major,
-                    b"minorFont" => ctx = FontCtx::Minor,
-                    b"latin" => {
-                        if let Ok(Some(tf)) = xml::optional_attr_str(e, b"typeface") {
+                    "majorFont" => ctx = FontCtx::Major,
+                    "minorFont" => ctx = FontCtx::Minor,
+                    "latin" => {
+                        if let Ok(Some(tf)) = xml::optional_attr_str(e, "typeface") {
                             let typeface = tf.into_owned();
                             match ctx {
                                 FontCtx::Major => major_latin = typeface,
@@ -310,8 +310,8 @@ fn parse_font_scheme(
                             }
                         }
                     },
-                    b"ea" => {
-                        if let Ok(Some(tf)) = xml::optional_attr_str(e, b"typeface") {
+                    "ea" => {
+                        if let Ok(Some(tf)) = xml::optional_attr_str(e, "typeface") {
                             let typeface = tf.into_owned();
                             if !typeface.is_empty() {
                                 match ctx {
@@ -322,8 +322,8 @@ fn parse_font_scheme(
                             }
                         }
                     },
-                    b"cs" => {
-                        if let Ok(Some(tf)) = xml::optional_attr_str(e, b"typeface") {
+                    "cs" => {
+                        if let Ok(Some(tf)) = xml::optional_attr_str(e, "typeface") {
                             let typeface = tf.into_owned();
                             if !typeface.is_empty() {
                                 match ctx {
@@ -342,8 +342,8 @@ fn parse_font_scheme(
                 let local_bytes = local.as_ref();
 
                 match local_bytes {
-                    b"fontScheme" => break,
-                    b"majorFont" | b"minorFont" => ctx = FontCtx::None,
+                    "fontScheme" => break,
+                    "majorFont" | "minorFont" => ctx = FontCtx::None,
                     _ => {},
                 }
             },
@@ -380,6 +380,12 @@ pub enum ColorRef {
         tint: Option<f64>,
         /// Shade adjustment (0.0–1.0), darkens the color when positive.
         shade: Option<f64>,
+        /// The literal `w:val` / `val` colour written alongside the theme
+        /// reference. OOXML producers emit it as the last-resort value for
+        /// consumers that cannot resolve the theme; keeping it means a
+        /// document with a missing or unreadable theme part still renders
+        /// its colours instead of falling back to black.
+        fallback: Option<RgbColor>,
     },
     /// System color (e.g., "windowText", "window").
     System(String),
@@ -392,10 +398,16 @@ impl ColorRef {
     pub fn resolve(&self, theme: &Theme) -> RgbColor {
         match self {
             Self::Rgb(rgb) => rgb.clone(),
-            Self::Theme { slot, tint, shade } => {
+            Self::Theme {
+                slot,
+                tint,
+                shade,
+                fallback,
+            } => {
                 let base = theme
                     .resolve_color(*slot)
                     .cloned()
+                    .or_else(|| fallback.clone())
                     .unwrap_or(RgbColor([0, 0, 0]));
                 apply_tint_shade(&base, *tint, *shade)
             },
@@ -410,6 +422,33 @@ impl ColorRef {
                 }
             },
             Self::Auto => RgbColor([0, 0, 0]),
+        }
+    }
+
+    /// Resolve to an explicit RGB value, or `None` when the reference
+    /// carries no colour of its own (`auto`, or an unresolvable theme slot
+    /// with no `w:val` fallback). Unlike [`Self::resolve`] this never
+    /// invents black, so callers can leave the renderer's default in place.
+    pub fn resolve_opt(&self, theme: Option<&Theme>) -> Option<RgbColor> {
+        match self {
+            Self::Rgb(rgb) => Some(rgb.clone()),
+            Self::Theme {
+                slot,
+                tint,
+                shade,
+                fallback,
+            } => {
+                let base = theme
+                    .and_then(|t| t.resolve_color(*slot).cloned())
+                    .or_else(|| fallback.clone())?;
+                Some(apply_tint_shade(&base, *tint, *shade))
+            },
+            Self::System(name) => Some(match name.as_str() {
+                "window" | "highlightText" => RgbColor([255, 255, 255]),
+                "highlight" => RgbColor([0, 120, 215]),
+                _ => RgbColor([0, 0, 0]),
+            }),
+            Self::Auto => None,
         }
     }
 }
@@ -492,7 +531,7 @@ mod tests {
 </a:theme>"#;
 
     #[test]
-    fn parse_theme() {
+    fn test_parse_theme() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         assert_eq!(theme.name, "Office Theme");
         assert_eq!(theme.color_scheme.name, "Office");
@@ -500,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_theme_colors() {
+    fn test_parse_theme_colors() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let cs = &theme.color_scheme;
 
@@ -517,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_theme_fonts() {
+    fn test_parse_theme_fonts() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         assert_eq!(theme.font_scheme.major_latin, "Calibri Light");
         assert_eq!(theme.font_scheme.minor_latin, "Calibri");
@@ -526,16 +565,17 @@ mod tests {
     }
 
     #[test]
-    fn color_ref_resolve_rgb() {
+    fn test_color_ref_resolve_rgb() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let color = ColorRef::Rgb(RgbColor([128, 64, 32]));
         assert_eq!(color.resolve(&theme), RgbColor([128, 64, 32]));
     }
 
     #[test]
-    fn color_ref_resolve_theme() {
+    fn test_color_ref_resolve_theme() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let color = ColorRef::Theme {
+            fallback: None,
             slot: ThemeColorSlot::Accent1,
             tint: None,
             shade: None,
@@ -544,9 +584,10 @@ mod tests {
     }
 
     #[test]
-    fn color_ref_resolve_theme_with_tint() {
+    fn test_color_ref_resolve_theme_with_tint() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let color = ColorRef::Theme {
+            fallback: None,
             slot: ThemeColorSlot::Dk1,
             tint: Some(0.5),
             shade: None,
@@ -557,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn rgb_hex_round_trip() {
+    fn test_rgb_hex_round_trip() {
         let rgb = RgbColor::from_hex("4472C4").unwrap();
         assert_eq!(rgb.to_hex(), "4472C4");
         assert_eq!(rgb.red(), 0x44);
@@ -566,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_color_slot_from_scheme_val() {
+    fn test_theme_color_slot_from_scheme_val() {
         assert_eq!(ThemeColorSlot::from_scheme_val("accent1"), Some(ThemeColorSlot::Accent1));
         assert_eq!(ThemeColorSlot::from_scheme_val("dk1"), Some(ThemeColorSlot::Dk1));
         // tx1 maps to dk1 (text1 = dark1)

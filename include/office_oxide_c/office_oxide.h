@@ -21,6 +21,15 @@
  *   - Opaque handles must be freed with their corresponding *_free() function.
  *   - Static C strings returned as `const char*` (e.g., version, format names)
  *     are NOT to be freed.
+ *
+ * Thread-safety Convention:
+ *   - A handle must NOT be used from more than one thread at a time. Handles
+ *     carry no internal lock (same contract as sqlite3* or FILE*): two
+ *     concurrent calls on the same handle, or a *_free() racing any other call
+ *     on that handle, are undefined behaviour.
+ *   - Callers sharing a handle across threads must serialize every call on it
+ *     with their own mutex.
+ *   - Distinct handles are independent and may be used concurrently.
  */
 
 #ifndef OFFICE_OXIDE_H
@@ -215,7 +224,7 @@ uint32_t office_xlsx_writer_add_sheet(OfficeXlsxWriterHandle* handle, const char
  * value_type: OFFICE_CELL_EMPTY=0, OFFICE_CELL_STRING=1, OFFICE_CELL_NUMBER=2.
  * value_str used when value_type==1; value_num used when value_type==2.
  */
-void office_xlsx_sheet_set_cell(
+int32_t office_xlsx_sheet_set_cell(
     OfficeXlsxWriterHandle* handle,
     uint32_t sheet, uint32_t row, uint32_t col,
     int32_t value_type, const char* value_str, double value_num);
@@ -225,7 +234,7 @@ void office_xlsx_sheet_set_cell(
  * bold: apply bold weight.
  * bg_color: 6-char hex string ("D3D3D3") or NULL for no fill.
  */
-void office_xlsx_sheet_set_cell_styled(
+int32_t office_xlsx_sheet_set_cell_styled(
     OfficeXlsxWriterHandle* handle,
     uint32_t sheet, uint32_t row, uint32_t col,
     int32_t value_type, const char* value_str, double value_num,
@@ -280,12 +289,12 @@ void office_pptx_writer_set_presentation_size(
 uint32_t office_pptx_writer_add_slide(OfficePptxWriterHandle* handle);
 
 /** Set the slide title. */
-void office_pptx_slide_set_title(
+int32_t office_pptx_slide_set_title(
     OfficePptxWriterHandle* handle,
     uint32_t slide, const char* title);
 
 /** Add a plain text paragraph to the slide body. */
-void office_pptx_slide_add_text(
+int32_t office_pptx_slide_add_text(
     OfficePptxWriterHandle* handle,
     uint32_t slide, const char* text);
 

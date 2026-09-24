@@ -51,7 +51,8 @@ fn write_text(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str>) {
         }
         w.write_event(Event::Start(BytesStart::new(tag.to_string())))
             .expect("open");
-        w.write_event(Event::Text(BytesText::new(v))).expect("text");
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
+            .expect("text");
         w.write_event(Event::End(BytesEnd::new(tag.to_string())))
             .expect("close");
     }
@@ -65,7 +66,8 @@ fn write_dcterms(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str>) {
         let mut elem = BytesStart::new(tag.to_string());
         elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
         w.write_event(Event::Start(elem)).expect("open");
-        w.write_event(Event::Text(BytesText::new(v))).expect("text");
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
+            .expect("text");
         w.write_event(Event::End(BytesEnd::new(tag.to_string())))
             .expect("close");
     }
@@ -81,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_metadata_emits_only_root() {
+    fn test_empty_metadata_emits_only_root() {
         let meta = Metadata {
             format: DocumentFormat::Docx,
             ..Default::default()
@@ -94,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn title_and_author_are_emitted() {
+    fn test_title_and_author_are_emitted() {
         let meta = Metadata {
             format: DocumentFormat::Docx,
             title: Some("Hello".into()),
@@ -107,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_string_field_is_omitted() {
+    fn test_empty_string_field_is_omitted() {
         let meta = Metadata {
             format: DocumentFormat::Docx,
             title: Some(String::new()),
@@ -121,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn dcterms_carry_w3cdtf_type_attribute() {
+    fn test_dcterms_carry_w3cdtf_type_attribute() {
         let meta = Metadata {
             format: DocumentFormat::Docx,
             created: Some("2026-05-13T10:00:00Z".into()),
@@ -135,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn keywords_joined_with_comma() {
+    fn test_keywords_joined_with_comma() {
         let meta = Metadata {
             format: DocumentFormat::Docx,
             keywords: vec!["rust".into(), "office".into(), "oxide".into()],
@@ -146,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn no_keywords_omits_element() {
+    fn test_no_keywords_omits_element() {
         let meta = Metadata {
             format: DocumentFormat::Docx,
             ..Default::default()
@@ -156,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn content_type_is_core_properties() {
+    fn test_content_type_is_core_properties() {
         assert!(CONTENT_TYPE.ends_with("core-properties+xml"));
     }
 }
