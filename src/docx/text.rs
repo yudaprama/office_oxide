@@ -86,7 +86,7 @@ impl DocxDocument {
             baseurl,
         };
 
-        let (header_texts, footer_texts) = split_headers_footers(self, &ctx, baseurl);
+        let (header_texts, footer_texts) = split_headers_footers(self, &ctx);
         for h in &header_texts {
             out.push_str(h);
             out.push_str("\n\n");
@@ -143,7 +143,6 @@ impl DocxDocument {
 fn split_headers_footers(
     doc: &DocxDocument,
     ctx: &MarkdownCtx,
-    baseurl: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
     let mut headers: Vec<String> = Vec::new();
     let mut footers: Vec<String> = Vec::new();
